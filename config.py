@@ -26,7 +26,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "@PASTE_YOUR_BOT_USERNAME")
 
 # #1c Bot ka public naam / brand (jaisa users ko dikhega)
-BOT_BRAND = os.getenv("BOT_BRAND", "Ongoing")
+BOT_BRAND = os.getenv("BOT_BRAND", "Avenor Orbit")
 
 
 # ---------------------------------------------------------------------
@@ -171,6 +171,8 @@ def _int_env(name, default=0):
         return default
 
 
+# Admin role RAKHA hai (code me hai) par koi assign nahi — sirf owner chalayega.
+# Baad me chaho to Render me ADMIN_IDS=id1,id2 daal dena, kaam karega.
 ADMIN_IDS = [
     int(x)
     for x in os.getenv("ADMIN_IDS", "").split(",")
@@ -223,47 +225,24 @@ NOTIFY_OWNER = os.getenv("NOTIFY_OWNER", "False").lower() == "true"
 #   dega). Sabko enforce karna hai to sabki numeric id bhar do.
 # ---------------------------------------------------------------------
 LINK_BLOCKS = [
+    # Avenor Orbit ke 2 links. require_join = False -> FORCE-JOIN GATE OFF
+    # (koi channel join karne ki shart nahi). Buttons /start par dikhte hain.
+    # Baad me force-join chahiye to require_join: True kar dena aur id daal dena.
     {
-        "name": "AI",
-        "emoji": "🤖",
-        "url": "https://t.me/LinnetAICommunity",
-        # Public group ka @username bhi chalega (numeric id ki tarah). Isse
-        # membership SACH ME check hoti hai — tap ka jhol nahi.
-        "id": "@LinnetAICommunity",
-        "require_join": True,
-        "row": 1,          # AI akela, apni row mein
+        "name": "Avenor Apps AI",
+        "emoji": "📢",
+        "url": "https://t.me/AvenorAppsAI",
+        "id": "@AvenorAppsAI",
+        "require_join": False,
+        "row": 1,
     },
     {
-        "name": "ANIME WORLD HINDI",
-        "emoji": "🎬",
-        "url": "https://t.me/+eF2CEXI452o4ZjBl",
-        "id": None,
-        "require_join": True,
+        "name": "Avenor AI Community",
+        "emoji": "💬",
+        "url": "https://t.me/AvenorAICommunity",
+        "id": "@AvenorAICommunity",
+        "require_join": False,
         "row": 2,
-    },
-    {
-        "name": "ANIME UNIVERES HINDI",
-        "emoji": "🌸",
-        "url": "https://t.me/+edJ4U_obJBgzOWE1",
-        "id": None,
-        "require_join": True,
-        "row": 3,
-    },
-    {
-        "name": "HOYOVERSE ANIMES",
-        "emoji": "⚔️",
-        "url": "https://t.me/+UyqJ5I4HW-FlMjc1",
-        "id": None,
-        "require_join": True,
-        "row": 4,
-    },
-    {
-        "name": "ANIME WORLD NEWS",
-        "emoji": "📰",
-        "url": "https://t.me/+AnUG7H4xllZmMGI1",
-        "id": None,
-        "require_join": True,
-        "row": 5,
     },
 ]
 
@@ -291,6 +270,17 @@ MEMBERSHIP_CACHE_TTL = _int_env("MEMBERSHIP_CACHE_TTL", 60)
 # match karta hai. Saath me U+FE0E (variation selector) lagaya hai taaki wo
 # EMOJI na bane, saada text rahe. Chaho to badal sakte ho.
 DONE_MARK = os.getenv("DONE_MARK", "\u2714\ufe0e")
+
+# GUEST MODE (Bot API 10.0): user kisi bhi group me @botname mention kare to
+# bot WAHAN jawab de sakta hai — chahe wo us group ka member hi na ho. Bot
+# khud kisi group me join NAHI kar sakta (Telegram me aisa method nahi hai),
+# guest mode uski sabse kareeb cheez hai. BotFather > Bot Settings > Guest Mode
+# ON karna zaroori hai, warna ye update aayega hi nahi.
+# Join request aayi to TURANT approve kar do (koi approval button nahi).
+# False karne par sirf record hoga.
+AUTO_APPROVE_JOIN = os.getenv("AUTO_APPROVE_JOIN", "True").strip().lower() in ("1","true","yes","on")
+
+GUEST_MODE = os.getenv("GUEST_MODE", "True").strip().lower() in ("1", "true", "yes", "on")
 
 MIN_JOINS_REQUIRED = os.getenv("MIN_JOINS_REQUIRED", "all")
 
@@ -361,8 +351,8 @@ DB_PATH = os.getenv("DB_PATH", "data/db.json")
 #     Bot ko kabhi nahi batana ki wo kaunse model par chalta hai.
 # ---------------------------------------------------------------------
 # AI + Community links — bot inhe SIRF sahi waqt par share karta hai (spam nahi).
-AI_BOT_LINK = os.getenv("AI_BOT_LINK", "https://t.me/Linnet_Agents_Bot")
-COMMUNITY_LINK = os.getenv("COMMUNITY_LINK", "https://t.me/LinnetAICommunity")
+AI_BOT_LINK = os.getenv("AI_BOT_LINK", "https://t.me/AvenorOrbitBot")
+COMMUNITY_LINK = os.getenv("COMMUNITY_LINK", "https://t.me/AvenorAICommunity")
 
 _DEFAULT_SYSTEM_PROMPT = (
     'You are "Ongoing", the assistant inside this Telegram community.\n\n'
@@ -499,7 +489,7 @@ POST_CHANNELS = [
 ]
 
 # Post ke caption me credit line. "Ongoing" par click karne se ye link khulta hai.
-POST_CREDIT_TEXT = os.getenv("POST_CREDIT_TEXT", "Ongoing")
+POST_CREDIT_TEXT = os.getenv("POST_CREDIT_TEXT", "Avenor Orbit")
 POST_CREDIT_URL = os.getenv("POST_CREDIT_URL", "https://t.me/ANIME_WORLD_8BOT")
 
 # Episode line ke dono taraf ye emoji lagta hai (jaise 🫧 S01 EPISODE 01 ADDED 🫧)

@@ -60,6 +60,7 @@ from telegram.error import (
 )
 from telegram.constants import ChatType
 from telegram.ext import (
+    TypeHandler,
     Application,
     ApplicationBuilder,
     AIORateLimiter,
@@ -90,6 +91,8 @@ from config import (
     DB_PATH,
     MEMBERSHIP_CACHE_TTL,
     MIN_JOINS_REQUIRED,
+    GUEST_MODE,
+    AUTO_APPROVE_JOIN,
     DONE_MARK,
     OWNER_ID,
     OWNER_NAME,
@@ -1415,8 +1418,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.effective_message.reply_text(
         head + f"\n\n{fonts.small_caps('our channels')}:",
-        reply_markup=link_keyboard(extra_rows=[
-            [_btn(GATE_BUTTON_TEXT, callback_data="check_join", style="success")]]),
+        reply_markup=link_keyboard(extra_rows=(
+            [[_btn(GATE_BUTTON_TEXT, callback_data="check_join", style="success")]]
+            if has_required_blocks() else [])),
     )
 
 
@@ -2075,54 +2079,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
 
     # Join-request ka Approve button (sirf owner/admin dabaa sakta hai)
-    if data.startswith("jr_ok:"):
-        # Approve sirf ADMIN 1 (ADMIN_IDS[0]) ya OWNER kar sakta hai.
-        approver = ADMIN_IDS[0] if ADMIN_IDS else 0
-        if not (user.id == approver or is_owner(user.id)):
-            await q.answer("Only Admin 1 (or the owner) can approve this.", show_alert=True)
-            return
-        try:
-            _, cid, uid = data.split(":")
-            await context.bot.approve_chat_join_request(chat_id=int(cid), user_id=int(uid))
-            await q.answer("Approved")
-            try:
-                await q.edit_message_text((getattr(q.message, "text", "") or "") + "\n\n✅ APPROVED")
-            except Exception:
-                pass
-            try:
-                await context.bot.send_message(
-                    int(uid),
-                    "✅ Your join request was approved. Go back to the bot and "
-                    "tap the button below.",
-                )
-            except Exception:
-                pass
-        except Exception as e:
-            log.warning("Join approve fail: %s", e)
-            await q.answer(f"Approve fail: {e}", show_alert=True)
-        return
-
-    if data.startswith("promo_ok:"):
-        approver = ADMIN_IDS[0] if ADMIN_IDS else 0
-        if not (user.id == approver or is_owner(user.id)):
-            await q.answer("Only Admin 1 (or the owner) can approve this.", show_alert=True)
-            return
-        try:
-            _, cid, tuid = data.split(":")
-            await context.bot.promote_chat_member(
-                int(cid), int(tuid),
-                can_manage_chat=True, can_delete_messages=True, can_restrict_members=True,
-                can_invite_users=True, can_pin_messages=True, can_change_info=True)
-            await q.answer("Approved")
-            try:
-                await q.edit_message_text((getattr(q.message, "text", "") or "") + "\n\n✅ APPROVED")
-            except Exception:
-                pass
-        except Exception as e:
-            log.warning("Promote approve fail: %s", e)
-            await q.answer(f"Fail: {_err_hint(e)}", show_alert=True)
-        return
-
     if data.startswith("gateai:"):
         # "tap" wala block (kisi bot ka link). Membership check mumkin nahi —
         # tap ko "ho gaya" maan lo, aur link khol do.
@@ -2390,43 +2346,74 @@ async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  JOIN REQUESTS  (owner approval, auto nahi)
 # =====================================================================
 async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Join request aaya -> OWNER ko details + Approve button bhejo.
-    AUTO-approve NAHI hota — owner khud approve kare tabhi banda join karta hai."""
+    """Join request aayi -> record karo aur TURANT approve kar do.
+    Koi approval button nahi (Avenor Orbit me faltu approvals hata diye hain).
+    AUTO_APPROVE_JOIN=False karo to sirf record hoga, approve nahi hoga."""
     req = update.chat_join_request
     chat, usr = req.chat, req.from_user
     log.info("Join request: %s (id=%s) from %s (%s)",
              chat.title, chat.id, usr.id, usr.full_name)
-    # Chat ki asli numeric id SILENTLY seekh lo (koi DM spam nahi).
-    b = match_block_by_title(chat.title) if chat.title else None
-    if b:
-        db_set_chat_id(b["name"], chat.id)
-    # Request bhej diya -> gate is chat ke liye pass ho jayega.
+    b_ = match_block_by_title(chat.title) if chat.title else None
+    if b_:
+        db_set_chat_id(b_["name"], chat.id)
     db_add_request(usr.id, chat.id)
-
-    # Join request OWNER ko nahi — ADMIN 1 (ADMIN_IDS[0]) ko jaati hai.
-    target = ADMIN_IDS[0] if ADMIN_IDS else (OWNER_ID or 0)
-    if not target:
+    if not AUTO_APPROVE_JOIN:
         return
-    sc, bd = fonts.small_caps, fonts.bold
-    uname = ("@" + usr.username) if usr.username else "-"
-    lines = [
-        bd("NEW JOIN REQUEST"),
-        "",
-        f"{sc('chat')}     : {chat.title}",
-        f"{sc('chat id')}  : {chat.id}",
-        f"{sc('name')}     : {usr.full_name}",
-        f"{sc('user id')}  : {usr.id}",
-        f"{sc('username')} : {uname}",
-    ]
-    kb = InlineKeyboardMarkup([[
-        _btn("Approve", callback_data=f"jr_ok:{chat.id}:{usr.id}", style="success"),
-    ]])
     try:
-        await context.bot.send_message(target, "\n".join(lines), reply_markup=kb)
-    except Forbidden:
-        log.warning("Join-request DM nahi gayi — Admin 1 ne bot block kiya hai? (id %s)", target)
+        await context.bot.approve_chat_join_request(chat_id=chat.id, user_id=usr.id)
+        log.info("Join request auto-approved: %s (%s)", usr.full_name, usr.id)
     except Exception as e:
-        log.warning("Join-request DM fail (%s): %s", target, e)
+        log.warning("Join auto-approve fail (%s): %s", chat.id, e)
+
+
+async def on_guest_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """GUEST MODE (Bot API 10.0). User ne kisi group/chat me @botname mention
+    kiya jahan bot MEMBER HI NAHI hai. Bot wahin seedha jawab post karta hai.
+
+    Ye hi wo "kisi bhi group me jaakar baat karna" hai — bot khud kisi group me
+    join NAHI kar sakta (Telegram me aisa method nahi hai), par guest mode se
+    wo bina add hue wahan jawab de sakta hai.
+    BotFather > Bot Settings > Guest Mode ON hona chahiye."""
+    if not GUEST_MODE:
+        return
+    msg = getattr(update, "guest_message", None)
+    if not msg:
+        return
+    qid = getattr(msg, "guest_query_id", None)
+    if not qid:
+        return
+    user = getattr(msg, "from_user", None)
+    if user and db_is_banned(user.id):
+        return
+    me = await _get_me(context)
+    raw = (msg.text or "").strip()
+    prompt = _strip_mention(raw, me.username) or "Someone mentioned you. Greet them warmly."
+    where = "a Telegram group"
+    title = _clean_title(getattr(getattr(msg, "chat", None), "title", None))
+    if title:
+        where = f'the Telegram group "{title}"'
+    try:
+        await context.bot.send_chat_action(msg.chat_id, "typing")
+    except Exception:
+        pass
+    answer = await ask_ai(prompt, where=where,
+                          mem_key=f"g{msg.chat_id}:u{user.id}" if user else None,
+                          note=_owner_note(user.id) if user else "")
+    answer = _strip_urls(answer) or answer
+    # Jawab ke saath Avenor ke buttons — isi se naye log channel tak aate hain.
+    rows = [[_btn(x["name"], url=x["url"], style="primary")] for x in LINK_BLOCKS[:3]]
+    try:
+        from telegram import InlineQueryResultArticle, InputTextMessageContent
+        res = InlineQueryResultArticle(
+            id="guest1",
+            title=BOT_BRAND,
+            input_message_content=InputTextMessageContent(answer[:4000]),
+            reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+        )
+        await _safe(context.bot.answer_guest_query, guest_query_id=qid, result=res)
+        log.info("Guest reply bheja (%s)", msg.chat_id)
+    except Exception as e:
+        log.warning("Guest reply fail: %s", e)
 
 
 async def on_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2813,30 +2800,6 @@ async def cmd_promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             "Use: /promote <user_id>  (or reply to their message with /promote)")
         return
-    chat = update.effective_chat
-    # Admin ka /promote -> pehle ADMIN 1 ki approval. Owner seedha kar sakta hai.
-    if not is_owner(update.effective_user.id):
-        approver = ADMIN_IDS[0] if ADMIN_IDS else 0
-        if approver and approver != update.effective_user.id:
-            sc, bd = fonts.small_caps, fonts.bold
-            kb = InlineKeyboardMarkup([[_btn(
-                "Approve", callback_data=f"promo_ok:{chat.id}:{uid}",
-                style="success")]])
-            try:
-                await context.bot.send_message(
-                    approver,
-                    f"{bd('NEW ADMIN REQUEST')}\n\n"
-                    f"{sc('chat')} : {chat.title or chat.id}\n"
-                    f"{sc('by')}   : {update.effective_user.full_name}\n"
-                    f"{sc('user')} : {uid}\n\n"
-                    f"{sc('approving will run the promotion')}",
-                    reply_markup=kb)
-                await update.effective_message.reply_text(
-                    "Sent to Admin 1 for approval.")
-            except Exception as e:
-                await update.effective_message.reply_text(
-                    f"Could not send the approval request: {_err_hint(e)}")
-            return
     try:
         await context.bot.promote_chat_member(
             update.effective_chat.id, uid,
@@ -3553,6 +3516,9 @@ def build_application() -> Application:
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_member))
     # Group -> supergroup migration (chat id badal jaati hai)
     app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, on_migrate))
+    # GUEST MODE — group jahan bot member nahi hai, wahan @mention par jawab.
+    # Group 2 me (sabse aakhir) — baaki handlers ko disturb na kare.
+    app.add_handler(TypeHandler(Update, on_guest_message), group=2)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, on_group_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_private_message))
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, on_private_photo))
