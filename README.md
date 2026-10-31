@@ -75,7 +75,7 @@ python bot.py
 With no `WEBHOOK_URL` set the bot long-polls, which is what you want locally. On Render it switches to
 webhook mode automatically.
 
-Tests:
+The test suite is optional. If you add `tests/`, `pytest.ini` and `requirements-dev.txt`, run it with:
 
 ```bash
 pip install -r requirements-dev.txt
@@ -274,7 +274,7 @@ Privacy Policy, and set `PRIVACY_URL` so `/privacy` links to it.
 - All state still lives in one MongoDB document. It is bounded (posts, links, cached marks, audit log
   are all capped, and the document is measured before every write, with the owner alerted at 12 MiB
   and derived caches pruned at 16 MiB), but a real fix is entity-level collections — see
-  [docs/AUDIT-RESPONSE.md](docs/AUDIT-RESPONSE.md), finding DB-02.
+  [AUDIT-RESPONSE.md](AUDIT-RESPONSE.md), finding DB-02.
 - On Render's free tier the service sleeps after about 15 minutes idle, so the first request after a
   pause takes 30–50 seconds. A scheduled post may fire late for the same reason.
 - `python-telegram-bot` 22.8 targets Bot API 10.0. Rich messages and the 10.1–10.3 features are not
@@ -284,9 +284,9 @@ Privacy Policy, and set `PRIVACY_URL` so `/privacy` links to it.
 
 ## Documentation
 
-- [docs/AUDIT-RESPONSE.md](docs/AUDIT-RESPONSE.md) — every audit finding, what was changed, and what
-  is deliberately still open
-- [docs/OPERATIONS.md](docs/OPERATIONS.md) — degraded mode, restore, credential rotation, monitoring
+- [AUDIT-RESPONSE.md](AUDIT-RESPONSE.md) — every audit finding, what was changed, and what is
+  deliberately still open
+- [OPERATIONS.md](OPERATIONS.md) — degraded mode, restore, credential rotation, monitoring
 - [PRIVACY.md](PRIVACY.md) — the published policy
 - [CHANGELOG.md](CHANGELOG.md) — what changed in this revision
 

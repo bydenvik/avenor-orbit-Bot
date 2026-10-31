@@ -28,15 +28,12 @@ import asyncio
 import difflib
 import json
 import hmac
-import copy
 import logging
-from urllib.parse import (quote, urlsplit, urlunsplit,
-                           parse_qsl, urlencode)
+from urllib.parse import quote
 import os
 import random
 import re
 import secrets
-import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -134,8 +131,22 @@ from config import (
     _host_looks_wrong,
     AI_SYSTEM_PROMPT,
     AI_MAX_CHARS,
+    AUDIT_KEEP,
     AI_THINKING_LEVEL,
     AI_BUSY_MESSAGE,
+    AI_USER_WINDOW,
+    AI_USER_MAX,
+    AI_DAILY_MAX,
+    AI_GROUP_DAILY_MAX,
+    thinking_level_for,
+    PRIVACY_TEXT,
+    PRIVACY_URL,
+    DEFAULT_PRIVACY_TEXT,
+    CACHE_RETENTION_DAYS,
+    USER_RETENTION_DAYS,
+    DROP_PENDING_UPDATES,
+    WEBHOOK_CONCURRENCY,
+    STORAGE_FLUSH_EVERY,
 )
 
 logging.basicConfig(
@@ -150,549 +161,69 @@ NOT_MEMBER_STATUSES = {ChatMember.LEFT, ChatMember.BANNED}
 
 
 # =====================================================================
-#  DATABASE  (simple JSON store)
+#  STORAGE  —  saara persistence storage.py me hai
 # =====================================================================
-_db_lock = threading.Lock()
-
-
-def _db_default():
-    return {"users": {}, "referrals": {}, "banned": [],
-            "stats": {"total_started": 0}, "chat_ids": {}, "chats": {},
-            "requests": {}, "done": {}}
-
-
-def _now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-
-def _today():
-    return datetime.now(timezone.utc).strftime("%d %b %Y")
-
-
-_db_cache = None
-
-
-def _db_load_json():
-    """Local JSON file padho (fallback / pehli-baar seed ke liye)."""
-    if os.path.exists(DB_PATH):
-        try:
-            with open(DB_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            base = _db_default()
-            base.update(data)
-            return base
-        except Exception as e:
-            # Corrupt DB ko CHUPCHAAP reset MAT karo — warna saara data ud jata
-            # hai aur pata bhi nahi chalta. File alag rakho + log karo.
-            log.error("DB load fail (%s): %s", DB_PATH, e)
-            try:
-                bad = DB_PATH + ".corrupt-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-                os.replace(DB_PATH, bad)
-                log.error("Corrupt DB ko %s par bhej diya", bad)
-            except Exception:
-                pass
-    return _db_default()
-
-
-def _db_load():
-    """State ko memory me cache karo — HAR call par poora JSON parse nahi
-    (~20ms @5000 users). Mongo ho to wo boot par cache bhar deta hai; warna
-    pehli baar local file se aata hai. Caller isi dict ko badalta hai aur
-    _db_save() ko deta hai, isliye cache hamesha sync rehta hai."""
-    global _db_cache
-    if _db_cache is None:
-        _db_cache = _db_load_json()
-    return _db_cache
-
-
-def _db_save(data):
-    """State save karo.
-    • MongoDB on  -> memory cache + dirty flag (background me flush hota hai).
-                     Per-write JSON NAHI likhte (wo ~77ms leta tha) — JSON
-                     sirf periodic backup banta hai.
-    • MongoDB off -> pehle jaisa seedha JSON file likho (fsync ke saath)."""
-    global _db_cache, _mongo_dirty
-    _db_cache = data          # memory cache sync
-    if MONGO_ENABLED:
-        _mongo_dirty = True
-        return
-    _db_write_json(data)
-
-
-def _db_write_json(data):
-    """Local JSON file likho. Disk full / permission error par CRASH na ho."""
-    try:
-        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-        tmp = DB_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())   # power-loss par aadhi likhi file na bane
-        os.replace(tmp, DB_PATH)
-    except OSError as e:
-        log.error("DB save fail (disk full / permission?): %s", e)
-    except Exception as e:
-        log.error("DB save fail: %s", e)
-
-
-# =====================================================================
-#  MONGODB  (durable store)  —  write-behind, RAM cache hot path
-# =====================================================================
-#  Design: har db_* function memory cache ko badalta hai (sync, fast) aur
-#  _db_save() sirf ek "dirty" flag set karta hai. Ek background task har
-#  _MONGO_FLUSH_EVERY second par poori state Mongo me likh deta hai.
-#  Isse poore codebase ko async banane ki zaroorat nahi padi (20+ call sites
-#  sync hi rahe) aur event loop kabhi Mongo ke wait me block nahi hota.
-#  Motor DEPRECATED hai (May 2026) — isliye pymongo ka naya AsyncMongoClient.
-_mongo_client = None
-_mongo_ready = False
-_mongo_dirty = False
-_mongo_last_ok = 0.0
-_mongo_last_err = ""
-_MONGO_DOC_ID = "state"
-_MONGO_FLUSH_EVERY = 5          # seconds
-_MONGO_MIRROR_EVERY = 600       # local JSON backup (10 min)
-
-
-def _mongo_coll():
-    global _mongo_client
-    if _mongo_client is None:
-        from pymongo import AsyncMongoClient
-        from pymongo.server_api import ServerApi
-        _mongo_client = AsyncMongoClient(
-            MONGO_URI_SAFE, server_api=ServerApi("1"),
-            serverSelectionTimeoutMS=8000, connectTimeoutMS=8000,
-            retryWrites=True,
-        )
-    return _mongo_client[MONGO_DB]["state"]
-
-
-MONGO_PASSWORD_SET = bool((os.getenv("MONGO_PASSWORD") or "").strip())
-
-
-def _mongo_error_hint(e) -> str:
-    """Mongo error ko seedha, kaam ki baat me badlo. 'bad auth' jaisa generic
-    error user ko confuse karta hai — asli wajah ye teen hi hote hain."""
-    s = str(e).lower()
-    if "bad auth" in s or "authentication failed" in s or "code': 8000" in s:
-        return ("Username ya password galat hai.\n"
-                "  • Atlas > Database Access me apne DB USER ka password reset kar "
-                "— Atlas LOGIN password NAHI, wo alag hota hai.\n"
-                "  • Password me @ # $ / ? ! ho to MONGO_PASSWORD alag se daal — "
-                "bot khud encode kar dega. URI me seedha daalne par wo toot jata hai.")
-    if "server selection" in s or "timed out" in s or "timeout" in s:
-        return ("Atlas tak pahunch hi nahi paya. Atlas > Network Access me "
-                "0.0.0.0/0 add hai? (Render ka IP badalta rehta hai.)")
-    if "does not exist" in s or "dns" in s or "nodename" in s:
-        return ("Host ka naam nahi mila. Zyadatar wajah: URI me PLACEHOLDER host "
-                "(jaise cluster0.xxxxx...) pada hai, ya host haath se type karte "
-                "waqt 1/l ya 0/o galat ho gaya.\n"
-                "  • Atlas > Connect > Drivers > Python > string ka COPY icon "
-                "dabao. Haath se type bilkul mat karo.")
-    if "must be escaped" in s or "rfc 3986" in s or "quote_plus" in s:
-        return ("URI me koi character escape nahi tha (jaise @ ya space).\n"
-                "  • Ye bot ab khud theek kar deta hai — par tabhi jab code naya ho.\n"
-                "  • Render me redeploy kiya? Ya MONGO_PASSWORD me password daal de.")
-    if "ssl" in s or "tls" in s:
-        return "TLS problem — poora mongodb+srv:// wala string use kar."
-    return "MONGO_URI / MONGO_PASSWORD check kar (aur Render me redeploy kiya?)"
-
-
-def _mongo_doc(data) -> dict:
-    """State ko Mongo document banao (top-level keys, plus _id)."""
-    doc = {k: v for k, v in data.items() if k != "_id"}
-    doc["_id"] = _MONGO_DOC_ID
-    doc["_saved"] = _now()
-    return doc
-
-
-async def mongo_start() -> bool:
-    """Boot par: Mongo se state lo. Khali ho to local JSON seed karo.
-    Koi bhi dikkat -> local file par chalo (bot phir bhi chalta rahe)."""
-    global _mongo_ready, _db_cache
-    if not MONGO_ENABLED:
-        return False
-    _hbad = _host_looks_wrong(_clean_host(MONGO_HOST)) if MONGO_HOST else ""
-    if _hbad:
-        log.error("MongoDB host me galti: %s", _hbad)
-    try:
-        coll = _mongo_coll()
-        await _mongo_coll().database.command("ping")
-        doc = await coll.find_one({"_id": _MONGO_DOC_ID})
-        if doc:
-            doc.pop("_id", None)
-            doc.pop("_saved", None)
-            base = _db_default()
-            base.update(doc)
-            _db_cache = base
-            _mongo_ready = True
-            log.info("MongoDB connected — state load hui: %s users, %s chats, %s posts.",
-                     len(base.get("users", {})), len(base.get("chats", {})),
-                     len(base.get("posts", {})))
-        else:
-            base = _db_load_json()
-            await coll.replace_one({"_id": _MONGO_DOC_ID}, _mongo_doc(base), upsert=True)
-            _db_cache = base
-            _mongo_ready = True
-            log.info("MongoDB khali thi — local data seed kar diya (%s users).",
-                     len(base.get("users", {})))
-        return True
-    except Exception as e:
-        global _mongo_last_err
-        _mongo_last_err = e
-        _mongo_ready = False
-        log.error("MongoDB connect fail: %s", e)
-        log.error("MongoDB wajah: %s", _mongo_error_hint(e).replace("\n", " | "))
-        log.error("LOCAL FILE par chal raha hoon — data redeploy par ud sakta hai.")
-        return False
-
-
-async def mongo_flush(force=False) -> bool:
-    """Dirty ho to poori state Mongo me likh do."""
-    global _mongo_dirty, _mongo_last_ok
-    if not MONGO_ENABLED or not _mongo_ready:
-        return False
-    if not _mongo_dirty and not force:
-        return False
-    _mongo_dirty = False
-    try:
-        # deepcopy ZAROORI hai: _db_load() live dict deta hai jise handlers
-        # usi waqt badal rahe hote hain. Bina copy ke driver encode karte waqt
-        # "dictionary changed size during iteration" aa sakta hai, ya aadha
-        # purana aadha naya document save ho jata hai.
-        data = copy.deepcopy(_db_load())
-        await _mongo_coll().replace_one(
-            {"_id": _MONGO_DOC_ID}, _mongo_doc(data), upsert=True)
-        _mongo_last_ok = time.time()
-        return True
-    except Exception as e:
-        _mongo_dirty = True          # agla flush phir try karega
-        log.warning("MongoDB flush fail: %s", e)
-        return False
-
-
-async def mongo_loop():
-    """Background: dirty hone par flush + thodi-thodi der me local backup."""
-    last_mirror = 0.0
-    while True:
-        await asyncio.sleep(_MONGO_FLUSH_EVERY)
-        try:
-            await mongo_flush()
-            now = time.time()
-            if now - last_mirror > _MONGO_MIRROR_EVERY:
-                last_mirror = now
-                # Mongo hi asli store hai — ye sirf safety copy (fsync ke bina).
-                try:
-                    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-                    with open(DB_PATH + ".tmp", "w", encoding="utf-8") as f:
-                        json.dump(_db_load(), f, ensure_ascii=False)
-                    os.replace(DB_PATH + ".tmp", DB_PATH)
-                except Exception as e:
-                    log.warning("Local mirror fail: %s", e)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.warning("mongo_loop error: %s", e)
-
-
-def mongo_status() -> str:
-    """Insaan ki bhasha me storage ki haalat."""
-    if not MONGO_ENABLED:
-        return "local file (MongoDB set nahi hai)"
-    if not _mongo_ready:
-        return "MongoDB OFFLINE — local file par chal raha hai"
-    age = int(time.time() - _mongo_last_ok) if _mongo_last_ok else -1
-    return ("MongoDB connected" if age < 0 or age < 60
-            else f"MongoDB connected (last save {age}s pehle)")
-
-
-_chat_ids_cache = None
-
-
-def _learned_ids():
-    """Runtime me seekhi gayi chat ids ({block name: chat id})."""
-    global _chat_ids_cache
-    if _chat_ids_cache is None:
-        with _db_lock:
-            _chat_ids_cache = dict(_db_load().get("chat_ids", {}))
-    return _chat_ids_cache
-
-
-def db_replace_chat_id(old_id, new_id):
-    """Group -> supergroup migration: purani chat id ko nayi se badal do."""
-    global _chat_ids_cache
-    old_id, new_id = int(old_id), int(new_id)
-    with _db_lock:
-        data = _db_load()
-        changed = False
-        for name, cid in list(data.get("chat_ids", {}).items()):
-            if _cid_key(cid) == _cid_key(old_id):
-                data["chat_ids"][name] = new_id
-                changed = True
-        chats = data.setdefault("chats", {})
-        if str(old_id) in chats:
-            chats[str(new_id)] = chats.pop(str(old_id))
-            chats[str(new_id)]["id"] = new_id
-            changed = True
-        if changed:
-            _db_save(data)
-            _chat_ids_cache = dict(data["chat_ids"])
-
-
-def db_set_chat_id(name, chat_id):
-    """Block name -> numeric chat id yaad rakho (config edit ki zaroorat nahi)."""
-    global _chat_ids_cache
-    with _db_lock:
-        data = _db_load()
-        # @username bhi chalega — int("@AvenorAppsAI") ValueError deta hai
-        try:
-            data.setdefault("chat_ids", {})[name] = int(chat_id)
-        except (TypeError, ValueError):
-            data.setdefault("chat_ids", {})[name] = str(chat_id).strip()
-        _db_save(data)
-        _chat_ids_cache = dict(data["chat_ids"])
-
-
-def db_upsert_chat(chat_id, title, ctype, status=None):
-    """Bot jis bhi chat me hai uski detail yaad rakho (id, title, type, status)."""
-    with _db_lock:
-        data = _db_load()
-        c = data.setdefault("chats", {}).get(str(chat_id), {})
-        c.update({"id": int(chat_id), "title": title or "", "type": ctype or "",
-                  "seen": _now()})
-        if status:
-            c["status"] = status
-        data["chats"][str(chat_id)] = c
-        _db_save(data)
-
-
-def db_get_chats():
-    with _db_lock:
-        return dict(_db_load().get("chats", {}))
-
-
-_seen_cache: dict[int, float] = {}
-
-
-def db_add_user(user, bump_start=False):
-    """Naya user ho to True return karega.
-    bump_start=True (/start) -> 'Total started' bhi badhao, USI ek write me
-    (pehle alag db_count_start() doosra read+write karta tha — ab ek hi).
-    Normal messages par 5 min tak write skip hoti hai (speed)."""
-    if not bump_start and time.time() - _seen_cache.get(user.id, 0) < 300:
-        return False
-    _seen_cache[user.id] = time.time()
-    _prune(_seen_cache, 10000)
-    with _db_lock:
-        data = _db_load()
-        uid = str(user.id)
-        is_new = uid not in data["users"]
-        entry = data["users"].get(uid, {})
-        entry.update({
-            "id": user.id,
-            "first_name": user.first_name or "",
-            "username": user.username or "",
-            "last_seen": _now(),
-        })
-        if is_new:
-            entry["joined_at"] = _now()
-        data["users"][uid] = entry
-        if bump_start:
-            data["stats"]["total_started"] = data["stats"].get("total_started", 0) + 1
-        _db_save(data)
-        return is_new
-
-
-_done_cache = None
-# "tap" se verify hone wale blocks: {user_id: {block_name: ts}}.
-# (Sirf wahan jahan asli membership check MUMKIN hi nahi — jaise kisi bot ka link.)
-_DONE_TTL = 24 * 3600
-
-
-def _dones():
-    global _done_cache
-    if _done_cache is None:
-        with _db_lock:
-            _done_cache = dict(_db_load().get("done", {}))
-    return _done_cache
-
-
-def db_mark_done(user_id, key):
-    global _done_cache
-    with _db_lock:
-        d = _db_load()
-        r = d.setdefault("done", {})
-        r.setdefault(str(user_id), {})[str(key)] = time.time()
-        for k in list(r.keys())[: max(0, len(r) - 5000)]:
-            r.pop(k, None)
-        _db_save(d)
-        _done_cache = dict(r)
-
-
-def is_done(user_id, key) -> bool:
-    per = _dones().get(str(user_id)) or {}
-    ts = per.get(str(key))
-    try:
-        return bool(ts) and (time.time() - float(ts)) < _DONE_TTL
-    except (TypeError, ValueError):
-        return False
-
-
-_requests_cache = None
-
-# Join request sirf itni der valid hai. Iske baad sirf ASLI membership ginegi.
-# (Warna ek baar request bhej dene wala hamesha ke liye "verified" milta rehta.)
-_REQUEST_TTL = 24 * 3600
-
-
-def _requests():
-    """{user_id: {chat_id: timestamp}} — jinhone join REQUEST bhej di hai."""
-    global _requests_cache
-    if _requests_cache is None:
-        with _db_lock:
-            _requests_cache = dict(_db_load().get("requests", {}))
-    return _requests_cache
-
-
-def _per_user(per):
-    """Purana format (list) ko naye {chat_id: ts} me badlo."""
-    if isinstance(per, list):
-        return {str(c): 0 for c in per}
-    return dict(per or {})
-
-
-def db_add_request(user_id, chat_id):
-    global _requests_cache
-    with _db_lock:
-        d = _db_load()
-        r = d.setdefault("requests", {})
-        per = _per_user(r.get(str(user_id)))
-        per[_cid_key(chat_id)] = time.time()
-        r[str(user_id)] = per
-        for k in list(r.keys())[: max(0, len(r) - 5000)]:
-            r.pop(k, None)                      # bound rakho
-        _db_save(d)
-        _requests_cache = dict(r)
-
-
-def db_del_request(user_id, chat_id):
-    """User ne join kar liya ya LEAVE kar diya -> request record hata do.
-    Isi ke bina: join karke leave karne par bhi gate 'verified' maanta rehta tha."""
-    global _requests_cache
-    with _db_lock:
-        d = _db_load()
-        r = d.setdefault("requests", {})
-        if str(user_id) not in r:
-            return
-        per = _per_user(r.get(str(user_id)))
-        per.pop(_cid_key(chat_id), None)
-        if per:
-            r[str(user_id)] = per
-        else:
-            r.pop(str(user_id), None)
-        _db_save(d)
-        _requests_cache = dict(r)
-
-
-def has_request(user_id, chat_id) -> bool:
-    """User ne is chat me join request bhej di thi? Sirf _REQUEST_TTL tak valid —
-    uske baad sirf asli membership ginegi."""
-    per = _requests().get(str(user_id))
-    if not per:
-        return False
-    if isinstance(per, list):                   # purana format
-        return _cid_key(chat_id) in {_cid_key(c) for c in per}
-    ts = per.get(_cid_key(chat_id))
-    try:
-        return bool(ts) and (time.time() - float(ts)) < _REQUEST_TTL
-    except (TypeError, ValueError):
-        return False
-
-
-def db_user_exists(uid) -> bool:
-    with _db_lock:
-        return str(uid) in _db_load()["users"]
-
-
-def db_all_users():
-    with _db_lock:
-        return list(_db_load()["users"].values())
-
-
-_ban_cache = None
-
-
-def db_is_banned(uid):
-    """In-memory cache — har message par file read na ho (bottleneck fix)."""
-    global _ban_cache
-    if _ban_cache is None:
-        with _db_lock:
-            _ban_cache = set(_db_load()["banned"])
-    return int(uid) in _ban_cache
-
-
-def db_set_ban(uid, value=True):
-    global _ban_cache
-    with _db_lock:
-        data = _db_load()
-        uid = int(uid)
-        if value and uid not in data["banned"]:
-            data["banned"].append(uid)
-        if not value and uid in data["banned"]:
-            data["banned"].remove(uid)
-        _db_save(data)
-        _ban_cache = set(data["banned"])
-
-
-def db_add_referral(referrer_id, new_user_id):
-    """Naye user ko referrer ke khaate mein jodo (ek user sirf ek baar)."""
-    with _db_lock:
-        data = _db_load()
-        new_uid = str(new_user_id)
-        entry = data["users"].get(new_uid, {})
-        if entry.get("ref_by"):
-            return False
-        entry["ref_by"] = int(referrer_id)
-        data["users"][new_uid] = entry
-        ref = data["referrals"].get(str(referrer_id), {"count": 0, "users": []})
-        if int(new_user_id) not in ref["users"]:
-            ref["users"].append(int(new_user_id))
-            ref["count"] = len(ref["users"])
-            # Id list ko bound rakho — warna ek popular referrer hazaron ids
-            # jama kar leta aur document 16 MB limit ke kareeb pahunch jata.
-            # `count` exact rehta hai; sirf purani ids girati hain.
-            if len(ref["users"]) > 500:
-                del ref["users"][: len(ref["users"]) - 500]
-        data["referrals"][str(referrer_id)] = ref
-        _db_save(data)
-        return True
-
-
-def db_ref_count(uid):
-    with _db_lock:
-        ref = _db_load()["referrals"].get(str(uid))
-        return ref["count"] if ref else 0
-
-
-def db_ref_rank(uid):
-    with _db_lock:
-        refs = _db_load()["referrals"]
-        ordered = sorted(refs.items(), key=lambda kv: kv[1].get("count", 0), reverse=True)
-        for i, (k, _) in enumerate(ordered, start=1):
-            if k == str(uid):
-                return i
-        return 0
-
-
-def db_stats():
-    with _db_lock:
-        data = _db_load()
-        return {
-            "total_users": len(data["users"]),
-            "total_started": data["stats"].get("total_started", 0),
-            "banned": len(data["banned"]),
-            "referrals": sum(v.get("count", 0) for v in data["referrals"].values()),
-        }
+#  Pehle ye poora hissa (users, referrals, bans, chats, posts, links +
+#  Mongo write-behind) isi file me tha. Audit ne ARCH-01 aur DB-01 dono
+#  isi jagah pakde the: ek 550-line block jisme recovery defect tha aur
+#  jise alag se test karna mumkin nahi tha.
+#
+#  Ab storage.py ek state machine chalata hai (CONNECTING -> READY ->
+#  DEGRADED -> RECONNECTING -> READY) aur DEGRADED me har write local JSON
+#  par fsync ke saath jaati hai. Yahan sirf import hai — behaviour wahi
+#  hai, isliye handlers me kuch nahi badla.
+from storage import (
+    prune as _prune,
+    _now,
+    _today,
+    _cid_key,
+    _learned_ids,
+    db_replace_chat_id,
+    db_set_chat_id,
+    db_upsert_chat,
+    db_get_chats,
+    db_add_user,
+    db_user_exists,
+    db_all_users,
+    db_is_banned,
+    db_set_ban,
+    db_add_referral,
+    db_ref_count,
+    db_ref_rank,
+    db_stats,
+    db_mark_done,
+    is_done,
+    db_add_request,
+    db_del_request,
+    has_request,
+    db_link_add,
+    db_links,
+    db_links_dedupe,
+    db_post_save,
+    db_post_get,
+    db_post_all,
+    db_post_update,
+    audit_add,
+    audit_tail,
+    ai_budget_ok,
+    ai_budget_spend,
+    ai_usage,
+    delete_user_data,
+    purge_stale,
+    update_seen,
+    mark_update_seen,
+    health as storage_health,
+    status_text as mongo_status,
+    MONGO_PASSWORD_SET,
+    ping as storage_ping,
+    reset_client as storage_reset_client,
+    set_alert_hook,
+    connect as storage_connect,
+    loop as storage_loop,
+    close as storage_close,
+    mongo_error_hint as _mongo_error_hint,
+)
+import storage as _storage
 
 
 # =====================================================================
@@ -708,45 +239,66 @@ def _get_ai():
     return _ai_client
 
 
-_ai_config = None
+_ai_configs: dict = {}
 _thinking_off = False
 
 
-def _get_ai_config():
-    """GenerateContentConfig ek hi baar banao (thinking level ke saath).
-    Gemini 3 Flash default 'medium' thinking par slow chalta hai — isliye
-    'minimal' set karte hain, se delay kam hota hai."""
-    global _ai_config
-    if _ai_config is not None:
-        return _ai_config
+def _ai_system_prompt() -> str:
+    """System prompt (owner ka naam ho to wahi jodo). Ek hi jagah se."""
     sys_prompt = AI_SYSTEM_PROMPT
     if OWNER_NAME:
         sys_prompt += (
             f"\n\nThe owner of this bot is {OWNER_NAME}. If asked who owns or runs "
             f"this bot, say it is {OWNER_NAME}. Never share any user's private data."
         )
+    return sys_prompt
+
+
+def _get_ai_config(model: str | None = None):
+    """GenerateContentConfig — MODEL ke hisaab se, cache ke saath.
+
+    Audit AI-01: pehle poore bot ke liye EK hi config banti thi aur usme
+    AI_THINKING_LEVEL jaise-ka-taisa chala jata tha. Default "minimal" tha,
+    jo Gemini 3.8 Flash accept hi nahi karta — matlab PEHLI request hamesha
+    validation error deti thi aur phir retry me thinking band hota tha.
+    Ab level pehle model ke hisaab se validate hota hai
+    (config.thinking_level_for), isliye ek bhi request bekaar nahi jaati.
+    """
+    key = (str(model or ""), bool(_thinking_off))
+    cached = _ai_configs.get(key)
+    if cached is not None:
+        return cached
+    sys_prompt = _ai_system_prompt()
     kwargs = {"system_instruction": sys_prompt}
-    level = (AI_THINKING_LEVEL or "").strip().lower()
-    if level and not _thinking_off:
+    level = "" if _thinking_off else thinking_level_for(model or AI_MODEL)
+    wanted = (AI_THINKING_LEVEL or "").strip().lower()
+    if level and wanted and level != wanted:
+        log.warning("Thinking level '%s' is not supported by %s — using '%s' "
+                    "instead (config.py: AI_THINKING_LEVELS_BY_MODEL).",
+                    wanted, model or AI_MODEL, level)
+    if level:
         try:
             kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=level)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("ThinkingConfig ban nahi payi (%s) — bina thinking chalega.", e)
     try:
-        _ai_config = types.GenerateContentConfig(**kwargs)
+        cfg = types.GenerateContentConfig(**kwargs)
     except Exception:
         # SDK/model shape alag -> thinking ke bina
-        _ai_config = types.GenerateContentConfig(system_instruction=AI_SYSTEM_PROMPT)
-    return _ai_config
+        cfg = types.GenerateContentConfig(system_instruction=sys_prompt)
+    _ai_configs[key] = cfg
+    return cfg
 
 
-def _disable_thinking():
-    """Model ne thinking config reject kiya -> bina thinking par switch (self-heal)."""
-    global _thinking_off, _ai_config
+def _disable_thinking(model: str | None = None):
+    """Provider ne thinking config reject kiya -> poore process ke liye band.
+    Ye sirf tab chalta hai jab validation se pehle hi kuch aur ho gaya ho;
+    normal raaste me thinking_level_for() pehle hi theek kar deta hai."""
+    global _thinking_off
     if not _thinking_off:
         _thinking_off = True
-        _ai_config = None
-        log.warning("Thinking config disabled — the model rejected it.")
+        _ai_configs.clear()
+        log.warning("Thinking config disabled — %s rejected it.", model or AI_MODEL)
 
 
 # --- chhoti conversation memory (per USER, per chat) -------------------
@@ -810,9 +362,28 @@ def _run_ai(model: str, prompt: str, history=None) -> str:
     resp = client.models.generate_content(
         model=model,
         contents=contents,
-        config=_get_ai_config(),
+        config=_get_ai_config(model),
     )
     return (getattr(resp, "text", None) or "").strip()
+
+
+# Retry sirf un errors par jo waqai dobara try karne layak hain.
+# Pehle har error par retry hota tha — galat API key / galat model par bhi
+# do-do koshish jaati thi aur user ko sirf "busy" dikhta tha.
+_AI_RETRYABLE = (
+    "500", "502", "503", "504", "unavailable", "internal", "deadline",
+    "timeout", "timed out", "overloaded", "high demand", "429",
+    "resource_exhausted", "connection", "reset by peer",
+)
+_AI_FATAL = ("api key", "api_key", "permission", "unauthenticated",
+             "invalid argument", "not found", "400", "403", "401")
+
+
+def _ai_retryable(e) -> bool:
+    s = str(e).lower()
+    if any(h in s for h in _AI_FATAL):
+        return False
+    return any(h in s for h in _AI_RETRYABLE)
 
 
 def busy_message() -> str:
@@ -858,9 +429,17 @@ async def ask_ai(prompt: str, lite: bool = False, where: str = "", mem_key=None,
                 last_err = e
                 log.warning("AI fail (model=%s try=%s): %s", model, attempt + 1, e)
                 low = str(e).lower()
-                if "thinking" in low:   # sirf thinking-config ki galti
-                    _disable_thinking()
-                await asyncio.sleep(0.6 * (attempt + 1))  # chhota backoff
+                if "thinking" in low:
+                    # Provider ne level reject kiya -> config theek karo aur
+                    # turant dobara (sleep nahi, ye network error nahi hai).
+                    _disable_thinking(model)
+                    continue
+                if not _ai_retryable(e):
+                    # Galat key / galat model / permission — dobara try bekaar.
+                    # Agle model par jao (ho sakta hai wo chal jaye).
+                    break
+                # Exponential backoff + jitter (thundering herd se bachne ke liye).
+                await asyncio.sleep(min(0.5 * (2 ** attempt) + random.random() * 0.4, 4))
     log.error("AI poora fail: %s", last_err)
     # User ko kabhi provider ka naam nahi dikhna chahiye.
     return busy_message()
@@ -984,32 +563,52 @@ _check_cd: dict = {}
 
 # AI ke liye per-user rate limit (paid quota bachane ke liye)
 _ai_hits: dict = {}
-_AI_WINDOW = 60
-_AI_MAX = 15
 
 
 def _ai_allowed(uid) -> bool:
-    """Ek user 60 second me max _AI_MAX AI calls kar sakta hai.
+    """Ek user AI_USER_WINDOW second me max AI_USER_MAX AI calls kar sakta hai.
     LRU: access par key end me — active user evict na ho."""
     now = time.time()
     hits = _ai_hits.pop(uid, None)
     if hits is None:
         hits = []
     _ai_hits[uid] = hits
-    while hits and now - hits[0] > _AI_WINDOW:
+    while hits and now - hits[0] > AI_USER_WINDOW:
         hits.pop(0)
-    if len(hits) >= _AI_MAX:
+    if len(hits) >= AI_USER_MAX:
         return False
     hits.append(now)
     _prune(_ai_hits, 5000)
     return True
 
 
-def _prune(cache: dict, keep: int):
-    """Cache ko bounded rakho — memory leak se bachne ke liye."""
-    if len(cache) > keep:
-        for k in list(cache.keys())[: len(cache) - keep]:
-            cache.pop(k, None)
+def _ai_budget_blocked(group_id=None) -> bool:
+    """Roz ka poora budget (aur group ka budget) khatam?
+    Per-user limit 15/60s tha — par 200 users milkar wahi 15/60s use karte
+    hain, to poore bot ka kharcha kabhi nahi rukta tha. Ab ek global cap bhi."""
+    return not ai_budget_ok(group_id, AI_DAILY_MAX, AI_GROUP_DAILY_MAX)
+
+
+def _ai_count(group_id=None):
+    """Ek AI call ka hisaab rakho (budget ke liye)."""
+    try:
+        ai_budget_spend(group_id)
+    except Exception as e:
+        log.warning("AI usage ledger fail: %s", e)
+
+
+AI_BUDGET_MESSAGE = (
+    "I have reached today's answer limit, so I cannot reply right now.\n\n"
+    "Please try again tomorrow — or talk to the AI directly ({ai_link})."
+)
+
+
+def budget_message() -> str:
+    ai_block = next((b for b in LINK_BLOCKS if b["name"].strip().lower() == "ai"), None)
+    if "{ai_link}" not in AI_BUDGET_MESSAGE:
+        return AI_BUDGET_MESSAGE
+    return AI_BUDGET_MESSAGE.replace("{ai_link}", ai_block["url"] if ai_block else "AI")
+
 
 # bot ka apna info — har group message par get_me() API call na ho (speed)
 _bot_me = None
@@ -1168,12 +767,7 @@ def _btn(label, **kw):
     return InlineKeyboardButton(label, **kw)
 
 
-def _cid_key(chat_id) -> str:
-    """Chat id ka dict-key. Numeric (-100...) ya @username — dono chalte hain."""
-    try:
-        return str(int(chat_id))
-    except (TypeError, ValueError):
-        return str(chat_id or "").strip()
+# _cid_key ab storage.py se aata hai (ek hi jagah define hai).
 
 
 def _block_chat_id(blk):
@@ -1450,6 +1044,8 @@ _COMMANDS = [
     ("rules",    "read the community rules",           "member"),
     ("report",   "report a message to the admins",     "member"),
     ("ref",      "your invite link and count",         "member"),
+    ("privacy",  "what data is stored, and how to erase it", "member"),
+    ("delete_my_data", "erase your record and memory", "member"),
     ("admins",     "list the team",                    "admin"),
     ("settitle",   "rename this group",                "admin"),
     ("invitelink", "create an invite link",            "admin"),
@@ -1471,6 +1067,8 @@ _COMMANDS = [
     ("broadcast", "message everyone who started",      "owner"),
     ("ban",       "ban someone from the bot",          "owner"),
     ("unban",     "lift a bot ban",                    "owner"),
+    ("audit",     "recent admin actions",               "owner"),
+    ("btnstyle",  "test button colours",               "owner"),
 ]
 
 
@@ -1969,13 +1567,13 @@ async def cmd_mongo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out.append(f"{sc('MONGO_URI khali hai ya usme placeholder pada hai.')}")
         await _send_long(update.effective_message, "\n".join(out))
         return
-    # LIVE test
-    global _mongo_client
-    _mongo_client = None                     # purana client hatao, fresh banao
+    # LIVE test — purana (shayad dead) client chhod kar naya banate hain.
+    storage_reset_client()
     try:
-        await _mongo_coll().database.command("ping")
+        await storage_ping()
         out.append(f"{sc('result')}   : {bd('CONNECTED')}")
         out.append(f"{sc('saving to MongoDB is working')}")
+        out.append(f"{sc('state')}    : {bd(_storage.state())}")
     except Exception as e:
         out.append(f"{sc('result')}   : {bd('FAILED')}")
         out.append("")
@@ -2000,11 +1598,20 @@ async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _ready, _no_id = gate_report()
     # Koi require_join block hi nahi = gate jaan-boojh kar OFF hai -> READY.
     gate_ok = (not has_required_blocks()) or (bool(_ready) and not _no_id)
+    _st = storage_health()
+    _usage = ai_usage()
     out = [bd("BOT STATUS"), "", sep,
            f"{sc('storage')} : {bd(mongo_status())}",
+           f"{sc('state')}   : {bd(_st['state'])}",
+           f"{sc('durable')} : {bd('yes') if _st['durable'] else bd('NO')}",
            f"{sc('gate')}   : {bd('READY') if gate_ok else bd('NOT READY')}",
            f"{sc('checks')} : {len(_ready)}/{len(_ready) + len(_no_id)} {sc('channels')}",
+           f"{sc('ai today')} : {bd(str(_usage.get('total', 0)))}/{AI_DAILY_MAX or '∞'}",
            sep, ""]
+    if not _st["durable"]:
+        out.append(f"{bd('WARNING')}: data kisi durable store par nahi hai — "
+                   "Mongo bhi nahi, local write bhi fail.")
+        out.append("")
     if not gate_ok:
         out.append(f"{sc('the gate cannot block anyone yet')}.")
         out.append(f"{sc('add the bot as an ADMIN in')}: {', '.join(_no_id) if _no_id else '-'}")
@@ -2109,6 +1716,33 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{fonts.small_caps('come back here and tap Joined / Verify')}")
         except Exception:
             pass
+        return
+
+    if data.startswith("deldata:"):
+        # Privacy: user apna data khud delete kar sakta hai (PRIV-01).
+        if data.split(":", 1)[1] != "yes":
+            await q.answer("Cancelled")
+            try:
+                await q.edit_message_text("Nothing was deleted.")
+            except Exception:
+                pass
+            return
+        await q.answer("Deleting…")
+        res = await _do_delete_user_data(user.id)
+        try:
+            await q.edit_message_text(
+                "Deleted.\n\n"
+                f"Account record : {'removed' if res['user'] else 'nothing was stored'}\n"
+                f"Invite count   : {res['referrals']} removed\n"
+                f"Referral links : {res['referred_by']} cleaned\n"
+                f"Conversation   : {res['memory']} memory key(s) cleared\n\n"
+                "You can keep using the bot; a new record starts only if you "
+                "send /start again.")
+        except Exception:
+            pass
+        # Deletion ka record audit log me NAHI daalte — warna wahi user ka
+        # data dobara likh jata. Sirf server log me.
+        log.info("PRIVACY: user %s ne apna data delete kiya (%s)", user.id, res)
         return
 
     if data.startswith("bs:"):
@@ -2412,6 +2046,9 @@ async def on_guest_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(msg.chat_id, "typing")
     except Exception:
         pass
+    if _ai_budget_blocked(msg.chat_id):
+        return
+    _ai_count(msg.chat_id)
     answer = await ask_ai(prompt, where=where,
                           mem_key=f"g{msg.chat_id}:u{user.id}" if user else None,
                           note=_owner_note(user.id) if user else "")
@@ -2585,6 +2222,12 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"{fonts.small_caps('Slow down')} — {fonts.small_caps('too many messages, try again in a little while')}."
         )
         return
+    # Poore bot ka roz ka budget (per-user limit ke upar) — warna 200 log
+    # milkar bill kabhi nahi rok paate.
+    if _ai_budget_blocked():
+        await _safe(update.effective_message.reply_text, budget_message())
+        return
+    _ai_count()
     await _safe(context.bot.send_chat_action, update.effective_chat.id, "typing")
     await _safe(update.effective_message.reply_text,
                 await ask_ai(update.effective_message.text, where="a private chat",
@@ -2620,6 +2263,10 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Group/channel me gate NAHI — wahan seedha jawab do (gate sirf DM me).
     if not _ai_allowed(update.effective_user.id):
         return   # group me chupchaap skip (group spam na ho)
+    # Group ka apna roz ka budget — ek group poore bot ka quota na kha jaye.
+    if _ai_budget_blocked(msg.chat.id):
+        return
+    _ai_count(msg.chat.id)
     prompt = _strip_mention(msg.text, me.username) or "The user mentioned you. Greet them warmly."
     title = _clean_title(msg.chat.title)
     where = f'the Telegram group "{title}"' if title else "a Telegram group"
@@ -2735,6 +2382,8 @@ async def cmd_settitle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await context.bot.set_chat_title(update.effective_chat.id, title[:128])
+        audit_add(update.effective_user.id, "settitle", None,
+                  update.effective_chat.id, title[:80])
         await update.effective_message.reply_text(f"Name changed to: {title}")
     except Exception as e:
         await update.effective_message.reply_text(
@@ -2768,6 +2417,8 @@ async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, uid)
+        # Journal: kaun, kya, kisko, kahan (appeal / galti sudhaarne ke liye).
+        audit_add(update.effective_user.id, "kick", uid, update.effective_chat.id)
         await update.effective_message.reply_text(f"Kicked: {uid}")
     except Exception as e:
         await update.effective_message.reply_text(
@@ -2785,6 +2436,7 @@ async def cmd_unkick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await context.bot.unban_chat_member(update.effective_chat.id, uid, only_if_banned=True)
+        audit_add(update.effective_user.id, "unkick", uid, update.effective_chat.id)
         await update.effective_message.reply_text(f"Unbanned: {uid}")
     except Exception as e:
         await update.effective_message.reply_text(
@@ -2802,6 +2454,8 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await context.bot.delete_message(r.chat_id, r.message_id)
+        audit_add(update.effective_user.id, "del", (r.from_user.id if r.from_user else None),
+                  r.chat_id, (r.text or r.caption or "[media]")[:80])
         try:
             await msg.delete()
         except Exception:
@@ -2821,6 +2475,7 @@ async def cmd_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await context.bot.pin_chat_message(r.chat_id, r.message_id, disable_notification=True)
+        audit_add(update.effective_user.id, "pin", None, r.chat_id, f"msg {r.message_id}")
         await msg.reply_text("Pinned.")
     except Exception as e:
         await msg.reply_text(f"Failed: {_err_hint(e)}\n(The bot needs the 'Pin Messages' permission.)")
@@ -2841,6 +2496,7 @@ async def cmd_promote(update: Update, context: ContextTypes.DEFAULT_TYPE):
             can_manage_chat=True, can_delete_messages=True, can_restrict_members=True,
             can_invite_users=True, can_pin_messages=True, can_change_info=True,
         )
+        audit_add(update.effective_user.id, "promote", uid, update.effective_chat.id)
         await update.effective_message.reply_text(f"Promoted: {uid}")
     except Exception as e:
         await update.effective_message.reply_text(
@@ -2890,6 +2546,10 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat = update.effective_chat
     priv = chat.type == ChatType.PRIVATE
+    if _ai_budget_blocked(None if priv else chat.id):
+        await update.effective_message.reply_text(budget_message())
+        return
+    _ai_count(None if priv else chat.id)
     mem = f"u{uid}" if priv else f"g{chat.id}:u{uid}"
     try:
         await context.bot.send_chat_action(chat.id, "typing")
@@ -2942,120 +2602,9 @@ _pending_post: dict = {}
 _gate_msg: dict = {}
 
 
-_POSTS_KEEP = 200       # sirf itne posts rakho (Mongo doc 16 MB limit)
 
 
-# =====================================================================
-#  LINK REGISTRY  —  ek hi link do baar save na ho
-# =====================================================================
-def _norm_link(url) -> str:
-    """Link ko normalize karo taaki same link EK maana jaye.
-    - scheme/host lowercase, www. hatao
-    - trailing slash hatao
-    - tracking params (utm_*, fbclid, gclid, si, igshid) hatao
-    Iske bina "https://X.com/a/" aur "http://www.x.com/a?utm_source=tg" do
-    alag links ban jaate hain aur memory bekaar bharti hai."""
-    u = str(url or "").strip()
-    if not u:
-        return ""
-    if not u.lower().startswith(("http://", "https://")):
-        u = "https://" + u
-    try:
-        s = urlsplit(u)
-    except Exception:
-        return u.lower()
-    host = (s.hostname or "").lower()
-    if host.startswith("www."):
-        host = host[4:]
-    drop = ("fbclid", "gclid", "si", "igshid", "mc_cid", "mc_eid")
-    q = [(k, v) for k, v in parse_qsl(s.query, keep_blank_values=True)
-         if not k.lower().startswith("utm_") and k.lower() not in drop]
-    path = s.path.rstrip("/") or "/"
-    return urlunsplit(("https", host, path, urlencode(q), ""))
-
-
-def db_link_add(url, note="") -> tuple:
-    """Link save karo. Pehle se hai to WAHI wapas — naya entry nahi banta.
-    Returns (key, created)."""
-    key = _norm_link(url)
-    if not key:
-        return "", False
-    with _db_lock:
-        d = _db_load()
-        links = d.setdefault("links", {})
-        hit = links.get(key)
-        if hit:
-            hit["uses"] = int(hit.get("uses", 1)) + 1
-            hit["last"] = _now()
-            if note and not hit.get("note"):
-                hit["note"] = note
-            _db_save(d)
-            return key, False
-        links[key] = {"url": str(url).strip(), "note": note or "",
-                      "uses": 1, "first": _now(), "last": _now()}
-        _db_save(d)
-        return key, True
-
-
-def db_links() -> dict:
-    return dict(_db_load().get("links", {}))
-
-
-def db_links_dedupe() -> int:
-    """Purani entries ko normalize karke duplicate hatao — ek hi rakho.
-    (Registry se pehle jo links save hue the unke liye.)"""
-    with _db_lock:
-        d = _db_load()
-        links = d.get("links") or {}
-        seen, keep, removed = {}, {}, 0
-        for key, v in links.items():
-            nk = _norm_link(v.get("url") or key) or key
-            if nk in seen:
-                keep[seen[nk]]["uses"] = int(keep[seen[nk]].get("uses", 1)) + int(v.get("uses", 1))
-                removed += 1
-            else:
-                seen[nk] = nk
-                keep[nk] = dict(v)
-        if removed:
-            d["links"] = keep
-            _db_save(d)
-        return removed
-
-
-def db_post_save(code, data):
-    with _db_lock:
-        d = _db_load()
-        posts = d.setdefault("posts", {})
-        posts[code] = data
-        # Posts kabhi delete nahi hote the — document hamesha badhta jaata aur
-        # ek din 16 MB limit par pahunch kar save hi fail ho jata. Ab purane
-        # (sabse pehle banaye) posts gira dete hain.
-        if len(posts) > _POSTS_KEEP:
-            order = sorted(posts.items(), key=lambda kv: kv[1].get("created", ""))
-            for old_code, _ in order[: len(posts) - _POSTS_KEEP]:
-                posts.pop(old_code, None)
-        _db_save(d)
-
-
-def db_post_get(code):
-    with _db_lock:
-        return _db_load().get("posts", {}).get(code)
-
-
-def db_post_all():
-    with _db_lock:
-        return dict(_db_load().get("posts", {}))
-
-
-def db_post_update(code, **kw):
-    with _db_lock:
-        d = _db_load()
-        p = d.setdefault("posts", {}).get(code)
-        if not p:
-            return False
-        p.update(kw)
-        _db_save(d)
-        return True
+# Link registry aur posts ke db_* functions ab storage.py me hain.
 
 
 def _new_code() -> str:
@@ -3252,7 +2801,7 @@ def _run_ai_vision(data: bytes, prompt: str) -> str:
     client = _get_ai()
     part = types.Part.from_bytes(data=data, mime_type="image/jpeg")
     resp = client.models.generate_content(
-        model=AI_MODEL, contents=[part, prompt], config=_get_ai_config())
+        model=AI_MODEL, contents=[part, prompt], config=_get_ai_config(AI_MODEL))
     return (getattr(resp, "text", None) or "").strip()
 
 
@@ -3692,6 +3241,114 @@ async def cmd_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =====================================================================
+#  PRIVACY  (PRIV-01)  —  /privacy, /delete_my_data, /audit
+# =====================================================================
+def _forget_memory(uid) -> int:
+    """AI ki conversation memory se is user ke SAARE keys hatao.
+
+    Keys do tarah ki hoti hain: "u<id>" (DM) aur "g<chat>:u<id>" (group).
+    Sirf "u<id>" hatana aadha kaam hota — group wali memory reh jaati."""
+    suffix = f":u{uid}"
+    keys = [k for k in list(_history.keys())
+            if k == f"u{uid}" or k.endswith(suffix)]
+    for k in keys:
+        _history.pop(k, None)
+    return len(keys)
+
+
+async def _do_delete_user_data(uid) -> dict:
+    """Ek user ka data SAARE stores se hatao (DB + in-memory caches)."""
+    res = delete_user_data(uid)          # storage.py: users/referrals/bans/...
+    res["memory"] = _forget_memory(uid)
+    _ai_hits.pop(uid, None)
+    for key in [k for k in list(_member_cache.keys()) if k[0] == int(uid)]:
+        _member_cache.pop(key, None)
+    _post_flow.pop(uid, None)
+    _pending_post.pop(uid, None)
+    _gate_msg.pop(uid, None)
+    _check_cd.pop(uid, None)
+    return res
+
+
+async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/privacy — kaun sa data rakha hai, kahan jaata hai, kaise delete ho."""
+    text = PRIVACY_TEXT or DEFAULT_PRIVACY_TEXT
+    community = next((b["url"] for b in LINK_BLOCKS
+                      if "community" in str(b.get("name", "")).lower()), "")
+    text = (text.replace("{cache_days}", str(CACHE_RETENTION_DAYS))
+                .replace("{community}", community)
+                .replace("{bot}", BOT_USERNAME))
+    if PRIVACY_URL:
+        text += f"\n\nFull policy: {PRIVACY_URL}"
+    text += "\n\nSend /delete_my_data to erase your record now."
+    await _send_long(update.effective_message, text)
+
+
+async def cmd_delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delete_my_data — pehle confirm, phir delete (galti se na ho)."""
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.effective_message.reply_text(
+            "For safety this only works in a private chat with me: @"
+            f"{context.bot.username}")
+        return
+    kb = InlineKeyboardMarkup([[
+        _btn("Delete my data", callback_data="deldata:yes", style="danger"),
+        _btn("Cancel", callback_data="deldata:no", style="primary"),
+    ]])
+    await update.effective_message.reply_text(
+        "This deletes:\n"
+        "• your account record (id, name, username, dates)\n"
+        "• your invite count, and your id from other people's invite lists\n"
+        "• my memory of your conversations\n\n"
+        "It cannot be undone. Delete?",
+        reply_markup=kb)
+
+
+async def cmd_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner: haal ke admin actions — kaun, kya, kisko, kahan."""
+    if not await _need_owner(update):
+        return
+    entries = audit_tail(25)
+    sc, bd = fonts.small_caps, fonts.bold
+    if not entries:
+        await update.effective_message.reply_text(
+            "No admin actions recorded yet.")
+        return
+    out = [bd("ADMIN ACTION LOG"), ""]
+    for a in reversed(entries):
+        out.append(f"{a.get('ts', '-')}  {bd(str(a.get('action', '?')))}")
+        out.append(f"   {sc('by')} {a.get('actor', '-')}   {sc('on')} {a.get('target') or '-'}")
+        if a.get("chat"):
+            out.append(f"   {sc('chat')} {a['chat']}")
+        if a.get("detail"):
+            out.append(f"   {sc('note')} {a['detail']}")
+    out.append("")
+    out.append(f"{sc('kept')}: last {AUDIT_KEEP} actions ({sc('AUDIT_KEEP')})")
+    await _send_long(update.effective_message, "\n".join(out))
+
+
+async def _job_purge(context: ContextTypes.DEFAULT_TYPE):
+    """Retention: purane caches saaf karo (roz ek baar)."""
+    try:
+        res = purge_stale(CACHE_RETENTION_DAYS, USER_RETENTION_DAYS)
+        if any(res.values()):
+            log.info("Retention purge: %s", res)
+    except Exception as e:
+        log.warning("Retention purge fail: %s", e)
+
+
+def _schedule_maintenance(app: Application):
+    """Daily retention job — job_queue ho to hi (extra missing ho sakta hai)."""
+    jq = getattr(app, "job_queue", None)
+    if jq is None:
+        return
+    try:
+        jq.run_repeating(_job_purge, interval=86400, first=120, name="purge")
+    except Exception as e:
+        log.warning("Retention job set nahi hui: %s", e)
+
+
+# =====================================================================
 #  BUILD APPLICATION
 # =====================================================================
 def build_application() -> Application:
@@ -3731,6 +3388,9 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("links", cmd_links))
     app.add_handler(CommandHandler("posts", cmd_posts))
     app.add_handler(CommandHandler("btnstyle", cmd_btnstyle))
+    app.add_handler(CommandHandler("privacy", cmd_privacy))
+    app.add_handler(CommandHandler("delete_my_data", cmd_delete_my_data))
+    app.add_handler(CommandHandler("audit", cmd_audit))
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(ChatJoinRequestHandler(on_join_request))
@@ -3764,6 +3424,7 @@ def build_application() -> Application:
 def run_webhook(app: Application):
     from contextlib import asynccontextmanager
     from fastapi import FastAPI, Request, Response
+    from fastapi.responses import JSONResponse
     import uvicorn
 
     # RANDOM per-boot secret. BOT_TOKEN se derive NAHI karte — warna token
@@ -3778,10 +3439,14 @@ def run_webhook(app: Application):
         await _start_mongo(app)
         await verify_blocks_on_startup(app)
         await _rearm_posts(app)
+        _schedule_maintenance(app)
         await app.bot.set_webhook(
             url=f"{WEBHOOK_URL}{webhook_path}",
             allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
+            # Pehle ye HAMESHA True tha — restart ke waqt Telegram ke pending
+            # updates (messages, join requests) chup-chaap delete ho jaate the
+            # (audit TG-02). Ab config se, aur default False = kuch na phenko.
+            drop_pending_updates=DROP_PENDING_UPDATES,
             secret_token=secret,
         )
         await app.start()
@@ -3792,6 +3457,34 @@ def run_webhook(app: Application):
 
     api = FastAPI(lifespan=lifespan)
 
+    # ---- Update delivery (TG-01) ------------------------------------
+    # Pehle route seedha `await app.process_update(update)` karta tha, aur
+    # FastAPI ek hi waqt kai requests serve karta hai. Matlab ek hi chat ke
+    # do updates saath-saath chal sakte the — aur wo dono wahi shared state
+    # badalte hain (referral count, gate, /post flow). Isliye ab:
+    #   • ek hi chat ke updates ek line me (per-chat lock)
+    #   • alag-alag chats saath chal sakte hain (bounded semaphore)
+    #   • ek hi update_id dobara aaye to kaam dobara nahi hota (dedupe)
+    _chat_locks: dict = {}
+    _sem = asyncio.Semaphore(max(1, WEBHOOK_CONCURRENCY))
+
+    def _lock_for(key):
+        lock = _chat_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _chat_locks[key] = lock
+            if len(_chat_locks) > 2000:      # bound — memory leak nahi
+                for k in list(_chat_locks.keys())[: len(_chat_locks) - 2000]:
+                    if not _chat_locks[k].locked():
+                        _chat_locks.pop(k, None)
+        return lock
+
+    def _update_key(update):
+        """Serialization ki kunji: chat id. Chat na ho to update_id,
+        taaki do bilkul alag updates ek doosre ko roken na."""
+        chat = getattr(update, "effective_chat", None)
+        return f"c{chat.id}" if chat is not None else f"u{update.update_id}"
+
     @api.post(webhook_path)
     async def telegram_webhook(request: Request):
         # Telegram har request me ye header bhejta hai — match na ho to reject.
@@ -3800,14 +3493,58 @@ def run_webhook(app: Application):
         got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if not hmac.compare_digest(got, secret):
             return Response(status_code=403)
-        update = Update.de_json(await request.json(), app.bot)
-        await app.process_update(update)
+        try:
+            payload = await request.json()
+        except Exception:
+            return Response(status_code=400)
+        update = Update.de_json(payload, app.bot)
+
+        # Telegram wahi update DOBARA bhejta hai jab jawab late ho ya fail ho.
+        # Bina iske ek hi referral do baar count ho sakta tha.
+        if update_seen(update.update_id):
+            log.info("Duplicate update %s — skip.", update.update_id)
+            return Response(status_code=200)
+
+        async with _sem:
+            async with _lock_for(_update_key(update)):
+                try:
+                    await app.process_update(update)
+                except Exception:
+                    # 500 do to Telegram usi update ko hamesha dobara bhejta
+                    # rehta hai (loop). Handler-level errors pehle hi _safe()
+                    # aur on_error se log ho jaate hain — isliye 200.
+                    log.exception("Update %s process fail", update.update_id)
+                else:
+                    # Sirf SAFAL hone par mark — fail hua to Telegram ka retry
+                    # dobara process hoga (at-least-once).
+                    mark_update_seen(update.update_id)
         return Response(status_code=200)
+
+    _START = time.time()
 
     @api.api_route("/", methods=["GET", "HEAD"])
     @api.api_route("/health", methods=["GET", "HEAD"])
     async def health():
-        return {"status": "ok", "bot": "running"}
+        """Render ka health check. Hamesha 200 — warna degraded mode me
+        Render service ko restart karta rehta hai (aur wo theek nahi hai:
+        degraded bot kaam kar raha hai, bas local disk par)."""
+        h = storage_health()
+        return JSONResponse({
+            "status": "ok" if h["durable"] else "degraded",
+            "bot": "running",
+            "uptime_s": int(time.time() - _START),
+            "storage": h,
+            "ai_today": int(ai_usage().get("total", 0)),
+        })
+
+    @api.get("/ready")
+    async def ready():
+        """Strict check: 503 jab data kisi durable store par nahi hai.
+        Isko apne uptime monitor me lagao, /health ko nahi."""
+        h = storage_health()
+        ok = bool(h["durable"])
+        return JSONResponse({"ready": ok, "storage": h},
+                            status_code=200 if ok else 503)
 
     # access_log=False -> webhook ka secret path logs me print nahi hota.
     uvicorn.run(api, host="0.0.0.0", port=PORT, log_level="info", access_log=False)
@@ -3817,38 +3554,44 @@ _mongo_task = None
 
 
 async def _start_mongo(app: Application):
-    """Mongo se state load karo + background flush task chalao."""
+    """State load karo + background loop chalao (reconnect + flush + health).
+
+    Audit DB-01 ka asli fix: pehle yahan ek hi koshish hoti thi aur fail hone
+    par reconnection kabhi nahi hota tha. Ab storage_loop() khud backoff ke
+    saath dobara connect karta hai, isliye process restart ki zaroorat nahi."""
     global _mongo_task
-    ok = await mongo_start()
+    # storage ko owner ko alert bhejne ka raasta do (storage me telegram nahi).
+    set_alert_hook(lambda text: _notify_owner(app.bot, text))
+    ok = await storage_connect()
     if MONGO_ENABLED and not ok:
         await _notify_owner(
             app.bot,
-            "⚠️ MongoDB connect nahi hua — bot LOCAL FILE par chal raha hai.\n"
-            "Data redeploy par ud sakta hai.\n\n"
-            f"{_mongo_error_hint(_mongo_last_err)}\n\n"
+            "⚠️ MongoDB connect nahi hua — bot DEGRADED mode me hai.\n"
+            "Har change local file par (fsync ke saath) likha ja raha hai, aur "
+            "bot khud backoff ke saath dobara connect karta rahega — restart "
+            "ki zaroorat nahi.\n\n"
+            f"{_mongo_error_hint(storage_health().get('last_error') or '')}\n\n"
             "Live test: /mongo")
     if MONGO_ENABLED and _mongo_task is None:
-        _mongo_task = asyncio.create_task(mongo_loop())
-        log.info("Mongo flush loop chalu (har %ss).", _MONGO_FLUSH_EVERY)
+        _mongo_task = asyncio.create_task(storage_loop())
+        log.info("Storage loop chalu (flush har %ss, reconnect backoff max %ss).",
+                 STORAGE_FLUSH_EVERY, 60)
 
 
 async def _on_shutdown(app: Application):
-    """Bot band ho raha hai. DB memory me hai par HAR write turant disk par
-    jaati hai (os.replace + fsync), isliye yahan kuch bachana nahi hai —
-    sirf saaf log, taaki Render logs me dikhe."""
+    """Bot band ho raha hai — aakhri flush, phir loop band."""
+    global _mongo_task
     if _mongo_task is not None:
         _mongo_task.cancel()
-    if MONGO_ENABLED:
-        ok = await mongo_flush(force=True)
-        log.info("Shutdown: MongoDB final save %s.", "OK" if ok else "FAIL")
-    else:
-        log.info("Shutting down — data local file par save hai.")
+        _mongo_task = None
+    await storage_close()
 
 
 async def _polling_post_init(app: Application):
     await _start_mongo(app)
     await verify_blocks_on_startup(app)
     await _rearm_posts(app)
+    _schedule_maintenance(app)
 
 
 def main():
@@ -3864,7 +3607,8 @@ def main():
     else:
         log.info("Starting in POLLING mode (local).")
         app.post_init = _polling_post_init
-        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        app.run_polling(allowed_updates=Update.ALL_TYPES,
+                        drop_pending_updates=DROP_PENDING_UPDATES)
 
 
 if __name__ == "__main__":
