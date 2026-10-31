@@ -487,6 +487,13 @@ AI_PROMPT_FROM_ENV = bool((os.getenv("AI_SYSTEM_PROMPT") or "").strip())
 # AI reply ki max length per message (Telegram limit ~4096)
 AI_MAX_CHARS = _int_env("AI_MAX_CHARS", 3800)
 
+# AI ko apni ASLI capabilities batao? (audit ke baad mila: bot ko pata hi nahi
+# tha ki wo kya kar sakta hai — "main sirf baat kar sakta hoon" jaisa galat
+# jawab deta tha, aur "kya add karna hai" par owner se hi poochhta tha.)
+# Ye block bot ke apne commands se BANTA hai, isliye naya command add karne par
+# apne aap update ho jata hai — prompt aur code kabhi alag nahi padte.
+AI_CAPABILITIES_IN_PROMPT = _bool_env("AI_CAPABILITIES_IN_PROMPT", True)
+
 # ---- AI ka kharcha (cost control) -----------------------------------
 # Per-user window: ek user itne second me itni hi requests kar sakta hai
 AI_USER_WINDOW = _int_env("AI_USER_WINDOW", 60)
@@ -665,6 +672,16 @@ POST_EP_EMOJI = os.getenv("POST_EP_EMOJI", "🫧")
 
 # Post me "S03 EPISODE 01 ADDED" jaisi line AI banata hai? (False = season se)
 POST_EP_LINE = os.getenv("POST_EP_LINE", "True").lower() == "true"
+
+# End wali badge line ("UPDATE LIVE") ko caption me BEECH me dikhana hai?
+# Telegram me text center karne ka koi option nahi hai (align API me hi nahi),
+# isliye line ke aage spaces laga kar wo beech me laai jaati hai. Spaces
+# Telegram jaisi-ki-taisi rakhta hai, isliye ye chalta hai.
+# POST_BADGE_WIDTH = kitne character ki chaudi line maani jaye. Aapke phone
+# par caption ki line ~30-38 character hoti hai; 30 safe default hai. Zyada
+# spaces chahiye to badhao, kam chahiye to ghatao, band karna ho to False.
+POST_BADGE_CENTER = _bool_env("POST_BADGE_CENTER", True)
+POST_BADGE_WIDTH = _int_env("POST_BADGE_WIDTH", 34)
 
 # /post me banner image maangni hai? (AI vision se padhi jaati hai)
 POST_ASK_IMAGE = os.getenv("POST_ASK_IMAGE", "True").lower() == "true"

@@ -107,6 +107,8 @@ from config import (
     POST_CREDIT_URL,
     POST_EP_EMOJI,
     POST_EP_LINE,
+    POST_BADGE_CENTER,
+    POST_BADGE_WIDTH,
     POST_TYPES,
     POST_FIELDS,
     POST_FIELDS_BY_TYPE,
@@ -131,6 +133,7 @@ from config import (
     _host_looks_wrong,
     AI_SYSTEM_PROMPT,
     AI_MAX_CHARS,
+    AI_CAPABILITIES_IN_PROMPT,
     AUDIT_KEEP,
     AI_THINKING_LEVEL,
     AI_BUSY_MESSAGE,
@@ -243,6 +246,70 @@ _ai_configs: dict = {}
 _thinking_off = False
 
 
+def _capabilities_text() -> str:
+    """AI ko batata hai ki bot SACH ME kya kar sakta hai.
+
+    Pehle prompt me sirf "tum Avenor Orbit ho, aise baat karo" tha — bot ko
+    apne features ka pata hi nahi tha. Isliye "tum kya kar sakte ho?" par wo
+    "main sirf sawaalon ke jawab de sakta hoon" jaisa jawab deta tha, aur
+    "kya add karna hai" par owner se hi poochhta tha. Ulta nuksaan bhi tha:
+    wo aise features bata sakta tha jo hain hi nahi.
+
+    Ye list bot ke apne commands se BANTI hai (_COMMANDS), isliye naya command
+    add karne par prompt khud update hota hai — code aur prompt kabhi alag
+    nahi padte.
+
+    ZAROORI: sirf member-level commands batate hain. Owner-only tools
+    (stats/diag/broadcast/ban) ka zikr nahi — design hi ye hai ki admin ko
+    upar ka tier pata na chale.
+    """
+    desc = {c: d for c, d, r in _COMMANDS}
+    lines = [
+        "WHAT THIS BOT CAN ACTUALLY DO",
+        "This list is the truth about your own features. Answer \"what can you "
+        "do\" from this list only. Never invent a feature that is not here, and "
+        "never promise one.",
+        "",
+        "Commands any member can use:",
+    ]
+    for c, d, r in _COMMANDS:
+        if r != "member":
+            continue
+        name = POST_COMMAND if c == "POSTCMD" else c
+        lines.append(f"- /{name}: {desc[c]}")
+    lines += [
+        "",
+        "Other things it does:",
+        "- Answers any private message as an assistant, no command needed.",
+        "- In a group, answers when someone mentions it with @username. With "
+        "Guest Mode on, it can answer in a group it has never joined.",
+        "- Gives every member an invite link with a live count.",
+        "- Welcomes new members with a banner, and shows the community rules.",
+        "- Group admins can also rename the group, create invite links, kick, "
+        "unban, delete messages, pin, and promote people.",
+        "- Admins and the owner can build and schedule channel posts.",
+        "- The owner has extra setup and broadcast tools. Do not list or "
+        "describe them; if asked, say the owner has additional tools.",
+        "",
+        "What it CANNOT do (say this plainly when asked):",
+        "- It cannot join a group or channel by itself. Telegram gives bots no "
+        "such method, so it can never add itself anywhere.",
+        "- It cannot read messages where it is not mentioned, or messages in "
+        "chats it is not part of.",
+        "- It has no long-term memory: it keeps only the last few turns of a "
+        "conversation, and that is cleared whenever the bot restarts.",
+        "- It cannot browse the internet, open a link, or fetch a URL.",
+        "- It cannot open, store, or analyse files you send it.",
+        "- It cannot control devices, make calls, send money, or take payments.",
+        "- It cannot message someone who has never started it.",
+        "",
+        "If someone asks you to add a feature or fix something: say the owner "
+        "decides what gets built, and that you can pass the suggestion on. Do "
+        "not promise anything and do not claim a change is already done.",
+    ]
+    return "\n".join(lines)
+
+
 def _ai_system_prompt() -> str:
     """System prompt (owner ka naam ho to wahi jodo). Ek hi jagah se."""
     sys_prompt = AI_SYSTEM_PROMPT
@@ -251,6 +318,8 @@ def _ai_system_prompt() -> str:
             f"\n\nThe owner of this bot is {OWNER_NAME}. If asked who owns or runs "
             f"this bot, say it is {OWNER_NAME}. Never share any user's private data."
         )
+    if AI_CAPABILITIES_IN_PROMPT:
+        sys_prompt += "\n\n" + _capabilities_text()
     return sys_prompt
 
 
@@ -2754,10 +2823,14 @@ def _post_caption(p, ep_line="", link_url="", text_links=True) -> str:
     if ep_line:
         em = f"{POST_EP_EMOJI} " if POST_EP_EMOJI else ""
         tail = f" {POST_EP_EMOJI}" if POST_EP_EMOJI else ""
+        # Badge ko BEECH me laao. Telegram me center karne ka koi option nahi
+        # hai, isliye aage spaces lagate hain (Telegram spaces preserve karta
+        # hai). Padding <a> tag ke BAAHAR hai, warna wo link ka hissa ban jati.
+        lead = _badge_pad(f"{em}{bd(ep_line)}{tail}")
         if link_url and text_links:
-            out.append(f'{em}<a href="{_esc(link_url)}">{_esc(bd(ep_line))}</a>{tail}')
+            out.append(f'{lead}{em}<a href="{_esc(link_url)}">{_esc(bd(ep_line))}</a>{tail}')
         else:
-            out.append(f"{em}{_esc(bd(ep_line))}{tail}")
+            out.append(f"{lead}{em}{_esc(bd(ep_line))}{tail}")
     return "\n".join(out)
 
 
@@ -3001,21 +3074,65 @@ async def on_private_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _post_ask(update.effective_chat.id, context, user.id)
 
 
+CAPTION_LIMIT = 1024      # Telegram ki caption limit
+_TAG_ROOM = 40            # closing tags ke liye jagah
+
+
+def _text_width(s: str) -> float:
+    """Rendered width ka andaza, character count se behtar.
+    Emoji ~2 character jagah lete hain aur bold math letters (fonts.bold) ~1.3x
+    chaude hote hain — bina iske padding kam pad jati hai aur line phir bhi
+    left lagti hai."""
+    total = 0.0
+    for ch in s or "":
+        o = ord(ch)
+        if o >= 0x1F000:            # emoji
+            total += 2.0
+        elif 0x1D400 <= o <= 0x1D7FF:   # math bold / mono / script
+            total += 1.3
+        else:
+            total += 1.0
+    return total
+
+
+def _badge_pad(plain: str) -> str:
+    """Badge line ke aage spaces — Telegram me center alignment hoti hi nahi,
+    isliye ye hi ek tareeka hai.
+
+    POST_BADGE_WIDTH = line ki chaudai (character me). Aapke phone par caption
+    ki line ~34-40 character ki hoti hai. Beech se hat kar dikhe to:
+      +2 width  -> ek space aage (daayein)
+      -2 width  -> ek space peeche (baayein)
+    """
+    if not POST_BADGE_CENTER or POST_BADGE_WIDTH <= 0:
+        return ""
+    pad = int((POST_BADGE_WIDTH - _text_width(plain)) / 2)
+    return " " * max(0, pad)
+
+
 def _fit_caption(cap: str) -> str:
     """1024 limit — line par kaato AUR koi HTML tag adhoora na chhode.
+
     Line par kaatna kaafi nahi hai: <blockquote> kai lines par phaila hota
     hai, to tag khula reh jata hai aur Telegram poora caption reject kar deta
-    hai — wahi cheez jise rokne ke liye ye function hai."""
-    if len(cap) <= 1024:
+    hai — wahi cheez jise rokne ke liye ye function hai.
+
+    Aur ek chhoti galti thi: closing tags append karne ke baad caption phir
+    se 1024 se lamba ho sakta tha (har band tag 13 character tak jodta hai),
+    aur tab bhi Telegram reject karta. Isliye content ke liye 40 character
+    pehle hi rok dete hain.
+    """
+    if len(cap) <= CAPTION_LIMIT:
         return cap
+    budget = CAPTION_LIMIT - _TAG_ROOM
     keep, total = [], 0
     for line in cap.split("\n"):
         add = len(line) + (1 if keep else 0)
-        if total + add > 1024:
-            # Pehli line hi 1024 se lambi ho to poora caption khaali na ho —
+        if total + add > budget:
+            # Pehli line hi limit se lambi ho to poora caption khaali na ho —
             # us line ko kaat ke rakho.
             if not keep:
-                keep.append(line[:1024]); total = 1024
+                keep.append(line[:budget])
             break
         keep.append(line); total += add
     out = "\n".join(keep)
@@ -3023,7 +3140,8 @@ def _fit_caption(cap: str) -> str:
     for tag in ("blockquote", "a", "b", "i"):
         opens = out.count(f"<{tag}") - out.count(f"</{tag}>")
         out += f"</{tag}>" * max(0, opens)
-    return out
+    # aakhri safety: tag band karne ke baad bhi limit ke andar raho.
+    return out[:CAPTION_LIMIT]
 
 
 async def _post_send_one(context, cid, p, cap, kb, html=True):
