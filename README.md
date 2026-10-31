@@ -2,8 +2,8 @@
 
 A Telegram community bot that gates access behind channel membership, welcomes new members, answers messages with AI, sends join requests to the owner for approval, and grows through a referral system. Runs on Render as a webhook service.
 
-- Bot: https://t.me/AvenorOrbitBot
-- Repository: https://github.com/bydenvik/avenor-orbit-Bot
+- Bot: https://t.me/ANIME_WORLD_8BOT
+- Repository: https://github.com/DeepakDevss/Ongoing_Links_Bot
 
 ---
 
@@ -399,7 +399,7 @@ awaiting Mongo inside a handler is exactly the kind of block the performance sec
 2. **Network Access → add `0.0.0.0/0`.** This is required — Render's outbound IP is not fixed, so an
    allow-list of specific IPs will break on the next deploy.
 3. **Database → Connect → Drivers** → copy the string, put your real password in it.
-4. On Render, add it as the environment variable **`MONGO_URI`** (and optionally `MONGO_DB`, default
+4. On Render, add it as the environment variable **`MONGO_HOST`** + **`MONGO_USER`** + **`MONGO_PASSWORD`** (and optionally `MONGO_DB`, default
    `ongoing_bot`). Leave it unset and the bot falls back to the local file exactly as before.
 
 **Put the password in its own variable, `MONGO_PASSWORD`.** A password containing `@ # $ / ? ! % &`
@@ -626,9 +626,9 @@ Adding the bot to a group does not bypass the gate. Group members are subject to
 
 ## Related projects
 
-- **Avenor | AI Companion** — A Telegram AI bot with persistent memory, media understanding, and voice replies.
-  Repository: https://github.com/bydenvik/avenor-ai-telegram-bot
-  Bot: https://t.me/AvenorAIBot
+- **Linnet | AI Companion** — A Telegram AI bot with persistent memory, media understanding, and voice replies.
+  Repository: https://github.com/DeepakDevss/Linnet_AI_Telegram
+  Bot: https://t.me/Linnet_Agents_Bot
 
 ---
 
@@ -636,9 +636,9 @@ Adding the bot to a group does not bypass the gate. Group members are subject to
 
 Deepak Devs
 
-- GitHub: https://github.com/bydenvik
-- X: https://x.com/bydenvik
-- Reddit: https://www.reddit.com/u/bydenvik
+- GitHub: https://github.com/DeepakDevss
+- X: https://x.com/Deepak_Devs
+- Reddit: https://www.reddit.com/u/Deepak_Devs
 
 ---
 

@@ -28,7 +28,9 @@ import asyncio
 import difflib
 import json
 import hmac
+import copy
 import logging
+from urllib.parse import quote
 import os
 import random
 import re
@@ -288,8 +290,6 @@ def _mongo_error_hint(e) -> str:
         return ("URI me koi character escape nahi tha (jaise @ ya space).\n"
                 "  • Ye bot ab khud theek kar deta hai — par tabhi jab code naya ho.\n"
                 "  • Render me redeploy kiya? Ya MONGO_PASSWORD me password daal de.")
-    if "nodename" in s or "dns" in s or "getaddrinfo" in s:
-        return "Cluster ka host galat hai — connection string ka address check kar."
     if "ssl" in s or "tls" in s:
         return "TLS problem — poora mongodb+srv:// wala string use kar."
     return "MONGO_URI / MONGO_PASSWORD check kar (aur Render me redeploy kiya?)"
@@ -353,7 +353,11 @@ async def mongo_flush(force=False) -> bool:
         return False
     _mongo_dirty = False
     try:
-        data = _db_load()
+        # deepcopy ZAROORI hai: _db_load() live dict deta hai jise handlers
+        # usi waqt badal rahe hote hain. Bina copy ke driver encode karte waqt
+        # "dictionary changed size during iteration" aa sakta hai, ya aadha
+        # purana aadha naya document save ho jata hai.
+        data = copy.deepcopy(_db_load())
         await _mongo_coll().replace_one(
             {"_id": _MONGO_DOC_ID}, _mongo_doc(data), upsert=True)
         _mongo_last_ok = time.time()
@@ -419,7 +423,7 @@ def db_replace_chat_id(old_id, new_id):
         data = _db_load()
         changed = False
         for name, cid in list(data.get("chat_ids", {}).items()):
-            if int(cid) == old_id:
+            if _cid_key(cid) == _cid_key(old_id):
                 data["chat_ids"][name] = new_id
                 changed = True
         chats = data.setdefault("chats", {})
@@ -437,7 +441,11 @@ def db_set_chat_id(name, chat_id):
     global _chat_ids_cache
     with _db_lock:
         data = _db_load()
-        data.setdefault("chat_ids", {})[name] = int(chat_id)
+        # @username bhi chalega — int("@AvenorAppsAI") ValueError deta hai
+        try:
+            data.setdefault("chat_ids", {})[name] = int(chat_id)
+        except (TypeError, ValueError):
+            data.setdefault("chat_ids", {})[name] = str(chat_id).strip()
         _db_save(data)
         _chat_ids_cache = dict(data["chat_ids"])
 
@@ -590,7 +598,7 @@ def has_request(user_id, chat_id) -> bool:
     if not per:
         return False
     if isinstance(per, list):                   # purana format
-        return int(chat_id) in per
+        return _cid_key(chat_id) in {_cid_key(c) for c in per}
     ts = per.get(_cid_key(chat_id))
     try:
         return bool(ts) and (time.time() - float(ts)) < _REQUEST_TTL
@@ -847,7 +855,7 @@ async def ask_ai(prompt: str, lite: bool = False, where: str = "", mem_key=None,
                 last_err = e
                 log.warning("AI fail (model=%s try=%s): %s", model, attempt + 1, e)
                 low = str(e).lower()
-                if "thinking" in low or "unsupported" in low or "invalid" in low:
+                if "thinking" in low:   # sirf thinking-config ki galti
                     _disable_thinking()
                 await asyncio.sleep(0.6 * (attempt + 1))  # chhota backoff
     log.error("AI poora fail: %s", last_err)
@@ -1027,6 +1035,7 @@ async def _is_member(context, chat_id, user_id, force=False):
         log.warning("Membership check fail for %s: %s", chat_id, e)
         result = True if JOIN_FAIL_MODE == "open" else None
         _member_cache[key] = (result, now)
+        _prune(_member_cache, 5000)   # warna fail hote hote cache badhta rehta
         return result
     _member_cache[key] = (ok, now)
     _prune(_member_cache, 5000)
@@ -1239,7 +1248,8 @@ async def send_join_gate(update, context, edit=False, joined=None):
     sent = None
     if edit and update.callback_query:
         sent = await _safe(update.callback_query.edit_message_text, text, reply_markup=kb)
-        sent = update.callback_query.message
+        if sent is None:
+            sent = update.callback_query.message
     else:
         sent = await _safe(update.effective_message.reply_text, text, reply_markup=kb)
     uid = update.effective_user.id
@@ -1517,7 +1527,8 @@ async def cmd_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Share this link — when people join, your count goes up."
     )
     kb = InlineKeyboardMarkup([[_btn(
-        "Share", url=f"https://t.me/share/url?url={link}&text=Try this bot!",
+        "Share", url=("https://t.me/share/url?url="
+                      + quote(link, safe="") + "&text=Try%20this%20bot!"),
         style="primary")]])
     await update.effective_message.reply_text(text, reply_markup=kb)
 
@@ -1581,7 +1592,6 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not context.args and not msg.reply_to_message:
         # Bina message ke -> poora TOTAL dikhao (sirf is chat ka nahi).
-        users = db_all_users()
         chats = db_get_chats()
         s = db_stats()
         by_type = {}
@@ -1780,10 +1790,10 @@ async def _safe(fn, *a, _retries=1, **k):
         except ChatMigrated as e:
             # Group supergroup ban gaya — purani chat id dead ho gayi.
             log.warning("Chat migrate ho gayi -> %s", getattr(e, "new_chat_id", "?"))
-            try:
-                db_replace_chat_id(getattr(e, "old_chat_id", None) or 0, e.new_chat_id)
-            except Exception:
-                pass
+            # ChatMigrated me old_chat_id hota hi NAHI — sirf new_chat_id.
+            # Isliye purani id ka pata nahi chalta; on_migrate handler us
+            # service-message se theek karta hai jo migration par aata hai.
+            pass
             return None
         except Conflict as e:
             log.error("409 Conflict — do bot instances chal rahe hain? %s", e)
@@ -1863,7 +1873,7 @@ async def _known_chats_lines(context, me) -> list:
     for blk in LINK_BLOCKS:
         c = blk.get("id") or learned.get(blk["name"])
         if c:
-            bound[int(c)] = blk["name"]
+            bound[_cid_key(c)] = blk["name"]   # @username bhi chalega
     items = sorted(known.items(), key=lambda kv: kv[1].get("title", "").lower())
     for _k, c in items[:15]:
         cid = c.get("id")
@@ -1880,7 +1890,7 @@ async def _known_chats_lines(context, me) -> list:
             out.append(f"   {sc('members')} : {n}")
         except Exception:
             pass
-        out.append(f"   {sc('block')} : {bound.get(int(cid), '-') if cid else '-'}")
+        out.append(f"   {sc('block')} : {bound.get(_cid_key(cid), '-') if cid else '-'}")
     if len(items) > 15:
         out.append(f"… +{len(items) - 15} more")
     out.append("")
@@ -1983,9 +1993,9 @@ async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sep = "━━━━━━━━━━━━━━━━━"
     req_blocks = [x for x in LINK_BLOCKS if x.get("require_join")]
     joined_count = 0
-    verifiable = 0
     _ready, _no_id = gate_report()
-    gate_ok = bool(_ready) and not _no_id
+    # Koi require_join block hi nahi = gate jaan-boojh kar OFF hai -> READY.
+    gate_ok = (not has_required_blocks()) or (bool(_ready) and not _no_id)
     out = [bd("BOT STATUS"), "", sep,
            f"{sc('storage')} : {bd(mongo_status())}",
            f"{sc('gate')}   : {bd('READY') if gate_ok else bd('NOT READY')}",
@@ -2031,7 +2041,6 @@ async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
             out.append(f"{sc('you')}  : {bd('joined' if is_in else 'not joined')}")
             if is_in:
                 joined_count += 1
-            verifiable += 1
         except Exception as e:
             out.append(f"{sc('you')}  : {bd('?')} - {_err_hint(e)}")
         out.append("")
@@ -2214,7 +2223,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #                 pehle ye galti se PASS ho jata tha (user bina join kiye
     #                 "verified" mil jata tha). Ab BLOCK.
     #   joined < need -> kuch channels baaki hain -> BLOCK.
-    joined_ids = [c["id"] for c in joined]
+    joined_ids = [c["id"] for c in joined if c.get("id")]
     ready, no_id = gate_report()
     blocked = (need == 0) or (len(joined) < need)
     if blocked:
@@ -2243,13 +2252,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _prune(_gate_msg, 5000)
         if no_id or unknown:
             await _warn_admin_unverifiable(
-                context, [blk for blk in LINK_BLOCKS if _block_chat_id(blk) is None])
+                context, [blk for blk in LINK_BLOCKS
+                          if blk.get("require_join") and not _is_tap_block(blk)
+                          and _block_chat_id(blk) is None])
         return
 
     # Pass. (Ek hi baar answer karo — dobara answer karne par Telegram error deta hai.)
     await q.answer()
     log.info("Gate PASSED for %s (%s/%s joined)", user.id, len(joined), need)
-    if unknown and not joined and not missing:
+    if unknown:
         await _warn_admin_unverifiable(context, unknown)
 
     # Post deep link se aaya tha? Ab asli link (Request to Join) do.
@@ -2543,9 +2554,16 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     db_add_user(user)
     if db_is_banned(user.id):
         return
-    if user.id in _post_flow:
-        await _post_step(update, context)
-        return
+    fl = _post_flow.get(user.id)
+    if fl is not None:
+        # Flow kabhi expire nahi hota tha: /post shuru karke chhod dene par
+        # us user ke saare DM hamesha _post_step me jaate aur chup-chaap
+        # nigal liye jaate. Ab 30 min baad flow khud hat jata hai.
+        if time.time() - fl.get("_t", 0) > 1800:
+            _post_flow.pop(user.id, None)
+        else:
+            await _post_step(update, context)
+            return
     # Kisi channel/group ka message forward kiya? (chat id nikalne ke liye)
     # Owner/admin ke liye seedha id batao — warna AI us par baat karne lagta tha.
     fch = _forwarded_chat(update.effective_message)
@@ -2566,8 +2584,7 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Group/channel mein AI SIRF @mention par chalta hai (private mein bina
-    mention). Membership bhi yahan check hoti hai (warna group se gate bypass
-    ho jata)."""
+    mention)."""
     msg = update.effective_message
     if not msg or not msg.text:
         return
@@ -2576,8 +2593,16 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mentioned = False
     for e in (msg.entities or []):
         if e.type == "mention":
-            if msg.text[e.offset:e.offset + e.length].lower() == f"@{me.username.lower()}":
-                mentioned = True
+            # Telegram ke offset/length UTF-16 code units me hote hain, Python
+            # string ke code points me NAHI. Emoji ya koi bhi non-BMP character
+            # ho to seedha slicing galat hoti hai aur mention miss ho jata hai.
+            # parse_entity() PTB ka offset-safe helper hai.
+            try:
+                if msg.parse_entity(e).lower() == f"@{me.username.lower()}":
+                    mentioned = True
+            except Exception:
+                if msg.text[e.offset:e.offset + e.length].lower() == f"@{me.username.lower()}":
+                    mentioned = True
         elif e.type == "text_mention" and e.user and e.user.id == me.id:
             mentioned = True
     if not mentioned:
@@ -2600,7 +2625,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  ERROR HANDLER
 # =====================================================================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Update error: %s", context.error)
+    log.error("Update error: %s", context.error, exc_info=context.error)
 
 
 # =====================================================================
@@ -2907,10 +2932,21 @@ _pending_post: dict = {}
 _gate_msg: dict = {}
 
 
+_POSTS_KEEP = 200       # sirf itne posts rakho (Mongo doc 16 MB limit)
+
+
 def db_post_save(code, data):
     with _db_lock:
         d = _db_load()
-        d.setdefault("posts", {})[code] = data
+        posts = d.setdefault("posts", {})
+        posts[code] = data
+        # Posts kabhi delete nahi hote the — document hamesha badhta jaata aur
+        # ek din 16 MB limit par pahunch kar save hi fail ho jata. Ab purane
+        # (sabse pehle banaye) posts gira dete hain.
+        if len(posts) > _POSTS_KEEP:
+            order = sorted(posts.items(), key=lambda kv: kv[1].get("created", ""))
+            for old_code, _ in order[: len(posts) - _POSTS_KEEP]:
+                posts.pop(old_code, None)
         _db_save(d)
 
 
@@ -3047,12 +3083,6 @@ def _post_caption(p, ep_line="", link_url="", text_links=True) -> str:
         if link_url:
             out.append(sep)
             out.append(f"   ★ {_esc(bd('WATCH & DOWNLOAD'))} ★")
-        out.append(sep)
-    elif ep_line:
-        out.append(sep)
-        em = f"{POST_EP_EMOJI} " if POST_EP_EMOJI else ""
-        tail = f" {POST_EP_EMOJI}" if POST_EP_EMOJI else ""
-        out.append(f"   {em}{_esc(bd(ep_line))}{tail}")
         out.append(sep)
     return "\n".join(out)
 
@@ -3283,15 +3313,28 @@ async def on_private_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _fit_caption(cap: str) -> str:
-    """1024 limit — poore line par kaato, taaki HTML tag beech me na kate."""
+    """1024 limit — line par kaato AUR koi HTML tag adhoora na chhode.
+    Line par kaatna kaafi nahi hai: <blockquote> kai lines par phaila hota
+    hai, to tag khula reh jata hai aur Telegram poora caption reject kar deta
+    hai — wahi cheez jise rokne ke liye ye function hai."""
     if len(cap) <= 1024:
         return cap
-    keep = []
+    keep, total = [], 0
     for line in cap.split("\n"):
-        if len("\n".join(keep + [line])) > 1024:
+        add = len(line) + (1 if keep else 0)
+        if total + add > 1024:
+            # Pehli line hi 1024 se lambi ho to poora caption khaali na ho —
+            # us line ko kaat ke rakho.
+            if not keep:
+                keep.append(line[:1024]); total = 1024
             break
-        keep.append(line)
-    return "\n".join(keep)
+        keep.append(line); total += add
+    out = "\n".join(keep)
+    # jitne tag khule hain, unhe band karo (blockquote / a / b)
+    for tag in ("blockquote", "a", "b", "i"):
+        opens = out.count(f"<{tag}") - out.count(f"</{tag}>")
+        out += f"</{tag}>" * max(0, opens)
+    return out
 
 
 async def _post_send_one(context, cid, p, cap, kb, html=True):
@@ -3363,6 +3406,14 @@ async def _rearm_posts(app):
             if dt:
                 jq.run_once(_job_post, when=dt, data=code, name=f"post:{code}")
                 log.info("Re-armed scheduled post %s at %s", code, dt)
+            else:
+                # Time nikal gaya (Render restart) — chup-chaap chhodo mat,
+                # turant bhej do warna post hamesha ke liye gayab ho jata.
+                log.warning("Scheduled post %s ka time nikal gaya — ab bhej raha hoon.", code)
+                jq.run_once(_job_post, when=1, data=code, name=f"post:{code}")
+
+
+_bg_tasks: set = set()
 
 
 async def _welcome_upgrade(context, msg, name, p, kb):
@@ -3414,7 +3465,11 @@ async def _post_welcome(update, context, p, chat_id=None):
     if sent is None:
         return
     try:
-        asyncio.create_task(_welcome_upgrade(context, sent, name, p, kb))
+        # create_task ka reference rakho — warna CPython running task ko
+        # garbage-collect kar sakta hai aur upgrade beech me gayab ho jata.
+        _t = asyncio.create_task(_welcome_upgrade(context, sent, name, p, kb))
+        _bg_tasks.add(_t)
+        _t.add_done_callback(_bg_tasks.discard)
     except Exception:
         pass
 
