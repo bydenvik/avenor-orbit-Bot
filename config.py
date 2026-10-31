@@ -69,7 +69,7 @@ MONGO_PASSWORD_STRIPPED = len(_MONGO_PW_RAW) - len(MONGO_PASSWORD)
 
 # (B) Purana tareeka — poora connection string.
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
-MONGO_DB = os.getenv("MONGO_DB", "ongoing_bot").strip() or "ongoing_bot"
+MONGO_DB = os.getenv("MONGO_DB", "avenor_orbit").strip() or "avenor_orbit"
 
 
 def _clean_host(h: str) -> str:

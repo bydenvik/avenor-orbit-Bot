@@ -1,647 +1,191 @@
-# Ongoing Links
+# Avenor Orbit
 
-A Telegram community bot that gates access behind channel membership, welcomes new members, answers messages with AI, sends join requests to the owner for approval, and grows through a referral system. Runs on Render as a webhook service.
+A Telegram bot that manages a community and publishes to channels from one place. It greets and
+moderates members, answers questions as an AI assistant, builds and schedules channel posts with a
+tracked deep link, and keeps its state in MongoDB so nothing is lost on redeploy.
 
-- Bot: https://t.me/ANIME_WORLD_8BOT
-- Repository: https://github.com/DeepakDevss/Ongoing_Links_Bot
-
----
-
-## Overview
-
-Ongoing Links runs as a webhook-based Python service. It handles community management (force-join gate, owner approval of join requests, welcome messages, referral tracking) alongside an AI chat layer that replies to every private message and to group messages that @mention the bot.
-
-The force-join check runs in both private and group chats, so adding the bot to a group doesn't get anyone past the gate. All settings live in one file (`config.py`), and all runtime data is kept in a local JSON database.
+- **Bot:** [@AvenorOrbitBot](https://t.me/AvenorOrbitBot)
+- **Channel:** [Avenor Apps AI](https://t.me/AvenorAppsAI)
+- **Group:** [Avenor AI Community](https://t.me/AvenorAICommunity)
+- **Repository:** [github.com/bydenvik/avenor-orbit-Bot](https://github.com/bydenvik/avenor-orbit-Bot)
+- **Developer:** [bydenvik](https://github.com/bydenvik) · [X](https://x.com/bydenvik) · [Reddit](https://www.reddit.com/u/bydenvik)
 
 ---
 
-## Features
+## What it does
 
-- **Force-join gate, only on post links.** Chatting with the bot needs **no** joins at all. The gate appears only when someone opens the bot through a `/post` deep link — they must join (or request) the channels before the post's real link is handed over.
-- **Sending a join request is enough.** The bot records `chat_join_request` events, so a user who has *requested* to join counts as joined, even before an admin approves.
-- **Owner approval of join requests** — Each incoming join request is sent to the owner with the requester's details and an Approve button. Nothing is auto-approved.
-- **Welcome message** — New members get a photo caption welcome.
-- **AI chat** — Every private message gets an AI reply. In groups, the bot replies only when @mentioned.
-- **Referral system** — Each user gets a personal invite link. Invite counts are tracked and shown through `/ref`.
-- **Admin controls** — Broadcast, ban, unban, member lookup, ID management, and diagnostics for configured admins.
-- **Webhook deployment** — Runs behind FastAPI on Render. No polling loop.
+**Community management.** Welcomes new members with a banner, serves `/rules`, handles reports,
+gives every member a referral link with a live count, and lets admins rename the group, create invite
+links, kick, delete, pin, and promote.
+
+**AI assistant.** Replies to any private message without needing a command, and answers in a group
+when it is @mentioned. It mirrors the language the person writes in, remembers the last six turns per
+person per chat, and never claims to be human.
+
+**Guest mode.** Telegram lets a bot answer in a group it has *not* joined when someone mentions it.
+With Guest Mode enabled in BotFather, `@AvenorOrbitBot` works in any group without being added — the
+bot replies in place, with your channel buttons attached. This is the only supported way for a bot to
+reach a chat it is not a member of; a bot cannot add itself anywhere.
+
+**Post builder.** `/post` walks through a type, the target channels, an optional banner, and that
+type's fields, then publishes a photo post with a caption and a *Download & Watch* button. The button
+carries a deep link back to the bot, so every click is attributable. Posts can be scheduled in IST.
+
+**Storage.** State lives in memory and is flushed to MongoDB every five seconds. A free Atlas cluster
+never expires, so posts, chat IDs, and user records survive redeploys. Without MongoDB configured the
+bot falls back to a local JSON file.
 
 ---
 
 ## Stack
 
-| Component | Technology |
+| Layer | Choice |
 |---|---|
 | Language | Python 3.12 |
-| Bot framework | python-telegram-bot v22 |
-| Web framework | FastAPI (webhook server) |
-| Deployment | Render |
-| Storage | Local JSON database (`data/db.json`) |
+| Telegram | python-telegram-bot 22.8 (Bot API 10.0) |
+| Web server | FastAPI + Uvicorn, webhook mode |
+| AI | `google-genai` — `gemini-3.8-flash`, falling back to `gemini-3.5-flash-lite` |
+| Storage | In-memory cache, write-behind to MongoDB Atlas (`pymongo` async client) |
+| Hosting | Render |
 
 ---
 
-## Requirements
-
-- Python 3.12 or newer
-- A Telegram bot token from BotFather
-- An API key for the AI provider used by the bot
-- The numeric Telegram user ID of the bot administrator
-- One or more channel or group IDs to enforce the force-join gate against
-
----
-
-## Project Structure
-
-```
-Ongoing_Links_Bot/
-├── bot.py               Bot logic, database, AI, handlers, webhook server
-├── config.py            All settings — the only file that must be edited
-├── fonts.py             Unicode text styling helpers
-├── requirements.txt     Python dependencies
-├── render.yaml          Render blueprint (optional)
-├── env.example.txt      Environment variable template (no secrets)
-├── gitignore.txt        Rename to .gitignore before pushing
-├── welcome.png          Welcome image
-└── README.md
-```
-
-Runtime files, created automatically and not committed:
-
-```
-.env                Real credentials (never commit)
-data/db.json        Persistent user, chat, and referral data
-```
-
----
-
-## Setup
-
-### 1. Clone the repository
+## Quick start
 
 ```bash
-git clone https://github.com/DeepakDevss/Ongoing_Links_Bot.git
-cd Ongoing_Links_Bot
-```
-
-### 2. Install dependencies
-
-```bash
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+git clone https://github.com/bydenvik/avenor-orbit-Bot.git
+cd avenor-orbit-Bot
 pip install -r requirements.txt
-```
-
-### 3. Configure
-
-Copy the environment template and fill in the values:
-
-```bash
-cp env.example.txt .env
-```
-
-Then open `config.py` and set every value listed under Configuration below. For a standard deployment, `config.py` is the only file you need to edit.
-
-### 4. Prepare the repository for GitHub
-
-Rename `gitignore.txt` to `.gitignore` before pushing. This keeps `.env` and `data/db.json` out of your commits.
-
-```bash
-git mv gitignore.txt .gitignore
-```
-
-### 5. Run locally (optional)
-
-```bash
+cp env.example.txt .env      # then fill in the values below
 python bot.py
 ```
+
+With no `WEBHOOK_URL` set the bot long-polls, which is what you want locally. On Render it switches to
+webhook mode automatically.
 
 ---
 
 ## Configuration
 
-All settings live in `config.py`. The important ones are grouped below.
+Seven variables are needed. Everything else has a working default in `config.py`.
 
-### Credentials
-
-| Setting | Purpose |
+| Variable | What to put |
 |---|---|
-| Bot token | Telegram bot token issued by BotFather |
-| AI API key | Credentials for the AI provider |
-| Admin user ID | Numeric Telegram user ID of the primary administrator |
+| `BOT_TOKEN` | Token from [@BotFather](https://t.me/BotFather) |
+| `OWNER_ID` | Your Telegram user ID (`/id` gives it to you) |
+| `AI_API_KEY` | Google AI Studio key |
+| `MONGO_HOST` | `cluster0.xxxxx.mongodb.net` — the host only |
+| `MONGO_USER` | Atlas database user |
+| `MONGO_PASSWORD` | That user's password |
+| `BOT_USERNAME` | `@AvenorOrbitBot` |
 
-### Force-join gate
+**Why the host is separate from a connection string.** A full `mongodb+srv://user:pass@host/` string
+has to be hand-carried between three apps, and it breaks in four different ways: a typo in the host
+(`1` vs `l`, `0` vs `o`), a placeholder left in, a password containing `@` or a space, or a bad copy.
+Three short fields cannot break that way, and the bot assembles and percent-encodes the URI itself.
+`MONGO_URI` is still accepted if you prefer one string.
 
-| Setting | Purpose |
-|---|---|
-| Channel or group IDs | The chats a user must join before using the bot |
-| MIN_JOINS_REQUIRED | How many of those chats must be joined |
-| LINK_BLOCKS | Groupings used to organise the join buttons |
-| JOIN_FAIL_MODE | Behaviour when the join check cannot be completed |
-
-### Welcome and referrals
-
-| Setting | Purpose |
-|---|---|
-| Welcome image and caption | Message sent to new members |
-
-Other settings you may want (all optional, defaults are set in `config.py`):
-
-| Setting | Purpose |
-|---|---|
-| `OWNER_ID` / `OWNER_NAME` | Bot owner; skips the gate, full power |
-| `ADMIN_IDS` / `ADMIN_NAMES` | Admin IDs and their display names, in the same order |
-| `BOT_BRAND` | Display name used in messages (default `Ongoing`) |
-| `RULES_TEXT` | Text shown by `/rules` |
-| `NOTIFY_OWNER` | `True` = send DM notifications to the owner (default `False`) |
-| `GATE_MESSAGE` / `GATE_BUTTON_TEXT` / `JOIN_PROMPT` | Gate text, button label, and the "join first" prompt |
-| `AI_MODEL` / `AI_MODEL_LITE` / `AI_THINKING_LEVEL` | AI model IDs and thinking level |
-| `AI_BUSY_MESSAGE` | Message shown when the AI is overloaded |
-| `POST_CHANNELS` / `POST_ASK_IMAGE` | Channel buttons for `/post`, and whether to ask for a banner |
-| `MEMBERSHIP_CACHE_TTL` | Seconds a membership result is cached |
-| `WEBHOOK_SECRET` | Optional; otherwise a random secret is generated per boot |
-
-Refer to `config.py` for the exact variable names, accepted values, and inline comments.
-
----
-
-## Deploy on Render
-
-1. Push the repository to GitHub.
-2. Create a new Web Service on Render and connect the repository.
-3. Set the build command to `pip install -r requirements.txt`.
-4. Set the start command to `python bot.py`.
-5. Add the environment variables from your local `.env` in the Render dashboard.
-6. The bot registers its own webhook from Render's service URL (`RENDER_EXTERNAL_URL`). Do **not** set `WEBHOOK_URL` yourself.
-7. `data/db.json` lives on the local filesystem. Persistent disks need a paid Render plan; on the free tier the file is lost on every deploy.
-
-`render.yaml` is included as an optional blueprint for the same setup.
-
----
-
-## Bot Usage
-
-## Roles
-
-| Role | Who | Commands | Power |
-|---|---|---|---|
-| Owner | `OWNER_ID` | 27 | ALL permissions — every admin command plus the owner-only set. Skips the force-join gate. |
-| Admin | `ADMIN_IDS` (labelled by `ADMIN_NAMES`) | 18 | User commands plus group moderation and posting. No diagnostics, no ID/config commands, no bot-wide actions. |
-| Member | everyone else | 7 | User commands only. |
-
-`/help` shows each role a flat list of only their own commands — member and admin lists
-look complete, so neither can tell that a higher tier exists. The owner's list shows every
-command, with `★` marking the owner-only ones.
-
-`ADMIN_IDS[0]` is "Admin 1" — join requests and admin-promotion approvals go to Admin 1, never to the owner.
-
-**Approvals.** Two kinds, both handled by Admin 1 (the owner can always override):
-
-- **Join request** — someone asks to join a channel/group; Admin 1 gets the details and an Approve button.
-- **Promotion** — an admin runs `/promote` in a group; Admin 1 gets an Approve button before the promotion happens. The owner's own `/promote` runs directly.
-
-`/post` needs no approval.
+Optional: `MONGO_DB` (default `avenor_orbit`), `ADMIN_IDS`, `ADMIN_NAMES`, `BOT_BRAND`, `GUEST_MODE`,
+`AUTO_APPROVE_JOIN`, `NOTIFY_OWNER`. The full list with defaults is in `env.example.txt`.
 
 ---
 
 ## Commands
 
-### Everyone
+**Everyone** — `/start` `/help` `/id` `/ai` `/rules` `/report` `/ref`
 
-| Command | Description |
-|---|---|
-| `/start` | Entry point; runs the force-join check, then you can just type |
-| `/help` | The commands available to your role |
-| `/id` | Your Telegram user ID |
-| `/ref` | Your referral link and invite count |
-| `/rules` | The rules text (`RULES_TEXT`) |
-| `/ai <question>` | Ask the AI directly |
-| `/report` | Reply to a message to report it to the admins |
+**Admins** — `/admins` `/settitle` `/invitelink` `/kick` `/unkick` `/del` `/pin` `/promote` `/post` `/posts`
 
-### Admin and Owner
+**Owner** — `/stats` `/diag` `/mongo` `/chats` `/perms` `/getid` `/setid` `/broadcast` `/ban` `/unban`
 
-| Command | Description |
-|---|---|
-| `/admins` | Team list — admins see only admins; the owner also sees the owner entry |
-| `/post` | Build a channel post with a tracked deep link |
-| `/posts` | List built posts, their code and link |
-
-### Owner only
-
-| Command | Description |
-|---|---|
-| `/stats` | Full overview: users who started the bot, reachable, banned, `/start` count, referrals — **plus each channel's live member count** (from `getChatMemberCount`) and the total across all channels, and every chat the bot is in grouped by type |
-| `/getid` | Look up a chat ID from a forwarded message |
-| `/setid` | Set a configured chat ID |
-| `/diag` | Gate diagnostics, plus every chat the bot is in |
-| `/chats` | Every chat the bot is in — ID, type, bot status, bound block |
-| `/perms` | The bot's permissions in this chat, what each one means, and its command |
-| `/broadcast` | Send a message to all known users. With no message it prints a summary first: total users, reachable by DM, banned, and every chat the bot is in (grouped by type) |
-| `/ban` / `/unban` | Bot-wide ban / unban by user ID |
-
-An admin who sends an owner-only command gets *"Only the owner can do this."*
-
-### Group moderation — the bot must be an admin in that group
-
-| Command | Needs permission | What it does |
-|---|---|---|
-| `/settitle <title>` | Change Group Info | Renames the group |
-| `/invitelink` | Invite Users via Link | Creates an invite link |
-| `/kick` / `/unkick` | Ban Users | Bans / unbans a member |
-| `/del` | Delete Messages | Deletes the replied-to message |
-| `/pin` | Pin Messages | Pins the replied-to message |
-| `/promote` | Add New Admins | Promotes a member to admin (admin's request goes to Admin 1 for approval) |
-
-Reply to a member's message, or pass a user ID as the argument.
+Group commands need the bot to be an admin in that group. `/help` shows each role only its own
+commands, so a member never sees a list they cannot use.
 
 ---
 
-## Post builder — `/post`
+## `/post`
 
-Owner and admins only. Builds a channel post whose button is a tracked deep link.
+| Type | Fields |
+|---|---|
+| APK | Name, Version, Size, Android, Link |
+| Update | Name, Version, Whats New, Link |
+| AI Tool | Name, What It Does, Pricing, Link |
+| News | Headline, Summary, Source, Link |
+| Tip | Title, Tip, Link |
 
-1. `/post` → pick a type (`POST_TYPES`: Anime / Movie / Series).
-2. **Pick the channels** — the buttons come from `POST_CHANNELS`. Tap to toggle (`✅`), tap as many as you want, then **➡️ Done**. The post goes to every channel you selected.
-3. **Send the banner image.** The bot reads it with AI vision and shows what it read — as a hint only, nothing is filled in for you.
-4. The bot then asks for each field **for that type** — see `POST_FIELDS_BY_TYPE`. Anime and Series ask Name, Season, Episodes, Quality, Language, Link; a Movie asks Name, Year, Quality, Language, Link (no Season or Episodes). Reply to each, or send `skip` to leave one out. `Link` is the join destination (see below) — it is not printed in the post.
-5. Choose **Post now** or **Schedule** (time as `YYYY-MM-DD HH:MM`, or just `HH:MM` — IST).
+Targets are set in `POST_CHANNELS`; both the channel and the group are configured. The bot must be an
+admin where it posts.
 
-The post goes out as a **photo** (your banner) with a styled caption and a **Download & Watch** button. The button is a deep link — `https://t.me/<bot>?start=p<code>` — so when a reader taps it,
-their chat with the bot opens and the bot already knows which post it is.
+The caption is built from the type's fields, so adding a category is a two-line change in `config.py`:
+add it to `POST_TYPES` and give it an entry in `POST_FIELDS_BY_TYPE`. An optional `POST_BADGE_BY_TYPE`
+entry controls the badge line (`NEW APK`, `APP UPDATED`, and so on).
 
-The caption's detail lines are built from the type's own fields — drop `Name` and `Link` and the rest
-become the `►` lines, so a Movie shows `►Year` and an Anime shows `►Season`/`►Episodes`. The episode
-line is only generated for types that have a Season; a Movie gets `NEW MOVIE ADDED` instead.
-
-The caption looks like this (sent with `parse_mode=HTML` so the credit and the download line are
-real inline links):
-
-```
-▌❝ Attack On Titan ❞          <- <blockquote>
-
-▌►Season :- 03                <- <blockquote> (the quote bar)
-▌►Episodes :- 22
-▌►Quality :- 480p, 720p, 1080p, 4K [ DUAL ]
-▌►Language :- Hindi Dub [ #OFFICIAL ]
-
-▌[ Creadit - Ongoing ]        <- <blockquote>; "Ongoing" links to POST_CREDIT_URL
-
-━━━━━━━━━━━━━━━━━
-   🫧 S03 EPISODE 01 ADDED 🫧  <- AI (POST_EP_LINE); emoji from POST_EP_EMOJI
-━━━━━━━━━━━━━━━━━
-   ★ WATCH & DOWNLOAD ★
-━━━━━━━━━━━━━━━━━
-```
-
-(`▌` is the quote bar Telegram draws for `<blockquote>`.)
-
-The episode line, the `WATCH & DOWNLOAD` line and the button **all point to the same bot deep
-link**. Tapping any of them opens the bot chat and `/start` runs automatically, and the bot then
-hands over the link — exactly like the button.
-
-The `Link` field is **not printed as text**. It is the destination of the **Request to Join** button: the reader taps the post (or the button), the bot greets them, and that button opens the
-link you gave.
-
-The greeting is sent **immediately** — no AI wait — so the button appears the instant the deep link
-opens. The AI-written welcome line is fetched in the background and swaps in a moment later. That
-line is deliberately constrained: plain and respectful, no hype, no exclamation marks, no emoji, and
-no cheesy filler like "sit back and enjoy" — it only welcomes the reader and points at the button
-below. If you leave `Link` empty, the bot falls back to invite links for the channels you
-selected.
-
-There is no Genre line. The episode line is written by the AI from the name and season, with a
-single episode number (never a range); set `POST_EP_LINE=False` to build it from the season alone.
-Note the AI may guess the episode number — check the preview before posting.
-
-`/posts` lists every post with its code and link.
-
-**Links never depend on message text.** Every real link the bot hands out lives in an inline-keyboard
-button, and buttons are not message text — so anti-spam bots, link filters and preview settings cannot
-touch them. The caption's text links are decoration only: if a channel rejects the caption because of
-them, the bot automatically re-sends the same post with those text links removed and the button intact.
-
-**Three things worth knowing.** The bot can only post to a chat where it is an admin. Vision needs a
-working AI key — if it fails, the bot just skips pre-filling and asks you normally. And on a free
-Render instance the service sleeps when idle, so a scheduled post may fire late — keep the service
-awake (a cron ping to `/health`) or post immediately.
-
-`POST_COMMAND` renames the command; `POST_CHANNELS` sets the channel buttons; `POST_FIELDS` is the
-fallback question list and `POST_FIELDS_BY_TYPE` sets the questions per type; `POST_BUTTON_TEXT` (default `Download & Watch`) and `JOIN_BUTTON_TEXT` (default
-`Request to Join`) change the button labels; `POST_ASK_IMAGE` turns the banner step off.
-
-### Button labels carry no emoji
-
-Buttons are text only. The channel emojis still live in `LINK_BLOCKS` for reference but are not drawn
-on the buttons, and the post channel picker marks a chosen channel with `√` rather than a coloured
-emoji. If you had `POST_BUTTON_TEXT` or `JOIN_BUTTON_TEXT` set in your environment with an emoji,
-delete that variable to pick up the new default.
+If a channel rejects the HTML caption, the bot retries that channel once with a plain caption. The
+button still carries the link, so the post is not lost.
 
 ---
 
-## Reliability — how Telegram errors are handled
+## Storage
 
-Every outgoing call that matters goes through one wrapper, `_safe()`, so a single Telegram error can
-never kill a handler or leave a user with silence:
-
-| Error | What it means | What the bot does |
-| --- | --- | --- |
-| `RetryAfter` (429) | Flood control | Waits `retry_after` seconds (capped at 60) and retries once |
-| `Forbidden` (403) | User blocked the bot, account deleted, or the bot was kicked | Drops the send, logs it, moves on — retrying is pointless |
-| `ChatMigrated` | A group became a supergroup, so the chat ID changed | Rewrites the stored chat ID for that block automatically |
-| `TimedOut` | Network was slow | One retry |
-| `BadRequest` | Malformed request | Logs the reason, no retry |
-| `Conflict` (409) | Two bot instances polling at once | Logged as an error — a deploy usually leaves one behind |
-
-`/broadcast` distinguishes the three outcomes — **sent**, **blocked the bot**, and **failed** — and
-keeps a jittered delay between sends so it stays under Telegram's ~1 msg/sec per chat limit.
-
-## Versions and what is current (October 2026)
-
-| Piece | Version in use | Note |
-| --- | --- | --- |
-| python-telegram-bot | 22.8 | The latest on PyPI. It implements **Bot API 10.0** |
-| Bot API (Telegram) | 10.0 via PTB | The newest is **10.3** (24 Aug 2026) |
-| `google-genai` | 2.31.0 | Pinned `>=2.0,<3` |
-| Python | 3.12 | |
-
-**AI models.** `gemini-3.5-flash` is **deprecated** — the endpoint now auto-routes to `gemini-3.6-flash`.
-The bot uses `gemini-3.8-flash` as the main model and `gemini-3.5-flash-lite` (still current) as the
-fallback.
-
-**Not yet available.** Bot API 10.1–10.3 added ephemeral messages (a private reply inside a group),
-`DisabledButton`, and the `can_send_welcome_messages` admin right. python-telegram-bot has not shipped
-them yet, so the bot cannot use them — the group welcome is a normal message, and a channel still sends
-no "member joined" event to any bot.
-
-## Storage — MongoDB Atlas (so nothing expires)
-
-Render's filesystem is **ephemeral**: `data/db.json` is wiped on every deploy, and every post link and
-chat ID built up until then is gone. A **MongoDB Atlas free cluster never expires**, so the bot stores
-its state there.
-
-### How it is wired
-
-The whole app keeps talking to the same in-memory store it always did, and the database sits behind it:
-
-1. **Boot** — `mongo_start()` pings Atlas and loads the single state document into memory. If the
-   collection is empty (first run) the existing `data/db.json` is uploaded as the seed.
-2. **During the run** — every `db_*` write updates memory and sets a **dirty flag**. Nothing touches the
-   network, so no handler ever waits on Mongo.
-3. **Every 5 seconds** — a background task writes the state document if it is dirty.
-4. **Every 10 minutes** — a plain local JSON copy is written as a safety net.
+1. **Boot** — `mongo_start()` pings Atlas and loads the state document into memory. If the collection
+   is empty, the existing `data/db.json` is uploaded as the seed.
+2. **While running** — every write updates memory and sets a dirty flag. No handler ever waits on the
+   network.
+3. **Every five seconds** — a background task writes the state if it is dirty.
+4. **Every ten minutes** — a local JSON copy is written as a safety net.
 5. **Shutdown** — one final forced flush.
 
-This is deliberate: making every `db_*` call `async` would have meant rewriting 20+ call sites, and
-awaiting Mongo inside a handler is exactly the kind of block the performance section below is about.
+Free-tier Atlas limits worth knowing: 0.5 GB storage, 500 connections, roughly 100 operations per
+second, and the cluster pauses after 30 days with no connections. A post record is about 360 bytes and
+a user record about 160 bytes, so 0.5 GB holds roughly 1.4 million posts.
 
-### Setup
-
-1. Create a **free cluster** at [cloud.mongodb.com](https://cloud.mongodb.com) and a database user.
-2. **Network Access → add `0.0.0.0/0`.** This is required — Render's outbound IP is not fixed, so an
-   allow-list of specific IPs will break on the next deploy.
-3. **Database → Connect → Drivers** → copy the string, put your real password in it.
-4. On Render, add it as the environment variable **`MONGO_HOST`** + **`MONGO_USER`** + **`MONGO_PASSWORD`** (and optionally `MONGO_DB`, default
-   `ongoing_bot`). Leave it unset and the bot falls back to the local file exactly as before.
-
-**Put the password in its own variable, `MONGO_PASSWORD`.** A password containing `@ # $ / ? ! % &`
-must be percent-encoded before it goes in a URI — drop it in raw and the URI breaks, which Atlas
-reports as the very unhelpful `bad auth : Authentication failed` (code 8000). When `MONGO_PASSWORD` is
-set the bot encodes it itself and rebuilds the URI, so that whole class of mistake disappears. The
-username can stay in `MONGO_URI` (or go in `MONGO_USER`).
-
-**`/mongo`** (owner) runs a live connection test and prints the host, the username, whether a separate
-password is set, the database name, and — if it fails — the real reason. It never prints the password.
-
-Two things that cause `bad auth` almost every time: using your **Atlas account password** instead of the
-**database user's** password, and a password with special characters that was never encoded.
-
-`/diag` shows the storage line, so you can always see whether Mongo is connected. If it is not, the bot
-still runs — it logs the reason and messages the owner.
-
-**Free tier limits worth knowing:** 0.5 GB storage, 500 connections, ~100 operations/second, and the
-cluster **auto-pauses after 30 days with no connections** (the bot connecting keeps it awake).
-
-## Performance
-
-The JSON store is read through an in-memory cache, so the whole file is parsed **once** per process
-instead of on every call. Measured with 5,000 users:
-
-| Operation | Before | After |
-| --- | --- | --- |
-| `_db_load()` | 20,123 µs | **1.2 µs** |
-| `db_add_user()` (repeat user) | 101,744 µs | **1.0 µs** |
-| `db_is_banned()` | 23 µs | **0.4 µs** |
-| `has_request()` | 21.7 µs | **0.6 µs** |
-
-The only remaining blocking write is a **new** user's first insert (~77 ms — a full JSON rewrite plus
-`fsync`), which happens once per user and then not again for five minutes.
-
-## Force-Join Gate
-
-**The gate is not used for chatting.** Plain DMs, `/start` and `/ai` all work with zero joins. Plain
-`/start` shows the five channel buttons **plus the same *Joined / Verify* button**, so anyone can check
-their membership at any time — but nothing is withheld for chatting. The gate *runs* in exactly one
-place: when someone arrives through a **`/post` deep link**.
-
-That flow is:
-
-1. The post carries a button whose URL is `https://t.me/<bot>?start=p<code>`.
-2. Tapping it opens the bot and `/start` runs automatically.
-3. The **gate** appears — the channel buttons plus **Joined / Verify**.
-4. Tapping *Joined / Verify* checks the channels. If the user has not joined or requested them, the
-   bot sends the join prompt again (same buttons, same verify button).
-5. Once verified, the bot finally shows the post's **Request to Join** button, which opens the link.
-
-A user passes if they are a member **or** have a join request on record (`chat_join_request`) — the
-Bot API has no way to list pending requests, so the bot remembers them itself. That record is kept
-honest in two ways:
-
-- **Leaving clears it.** The bot listens for `chat_member` updates. The moment someone leaves or is
-  kicked, their request record is dropped and the membership cache is invalidated — so joining and
-  then leaving no longer passes the gate.
-- **It expires after 24 hours.** A request older than `_REQUEST_TTL` stops counting, and only real
-  membership will do after that.
-
-`MIN_JOINS_REQUIRED` defaults to `all`, so **every** block with `require_join: true` must be
-satisfied — currently the four anime channels **and the AI link** (five in total).
-
-### Blocks the bot cannot check: `"verify": "tap"`
-
-A block can be verified two ways:
-
-- **`"verify": "member"`** (the default) — a real `getChatMember` check, or a join request on record.
-  `"id"` may be a numeric id **or** a public `@username`; both work.
-- **`"verify": "tap"`** — for links the bot genuinely cannot check, such as **another bot's chat**
-  (Telegram gives no way for one bot to learn whether a user started another bot — `getChatMember` does
-  not work there). The button becomes a callback button; tapping it records the block as done and then
-  hands over the link. Only use this where a real check is impossible — a tap is not proof. It counts **every** `require_join` block in `LINK_BLOCKS` — not just the ones the
-bot happens to be able to verify, which is what it used to do (so a channel with no ID was silently
-excused and "all" meant fewer channels than configured).
-
-### Making the gate actually enforce
-
-The gate can only check a channel it has **both** of these for:
-
-1. the channel's **numeric chat id**, and
-2. the bot as an **admin** in that channel.
-
-The Bot API cannot resolve a private invite link (`t.me/+hash`) to a chat id — `checkChatInvite` is a
-client-API method, not a bot one. So a `require_join` block with `id: None` and no learned id **cannot
-be checked at all**, and the gate becomes decorative.
-
-The bot tells you this rather than pretending:
-
-- **Startup log** — `GATE NOT ENFORCING — no chat id for: …`
-- **`/diag`** — prints `gate : READY` or `NOT READY` at the very top, with the count of channels it
-  can check.
-- **`/chats`** — prints a ready-to-paste `/setid <block> <chat_id>` line for every block that has no
-  id yet.
-- **Owner DM** — when a user hits a gate that cannot check anything, the owner is told once, with the
-  fix.
-- **The user** is told plainly that the check is not set up yet and is let through, so a
-  half-configured gate never locks real readers out of a post.
-
-The easiest fix is to **add the bot as an admin in each channel** — it learns the id the moment it is
-added. If the channel title does not match a block name, bind it by hand with `/setid` (get the id
-from `/getid` by forwarding a message, or copy it from `/chats`).
-
-The gate is **strict and fails closed**:
-
-- *Request to Join* is handed over **only** when membership has actually been confirmed — joined **or**
-  a join request on record.
-- **Fail-closed.** If the bot cannot check at all — no chat id, **or it has an id but is not an admin
-  there**, so `getChatMember` errors — it does **not** let anyone through. It says it could not confirm
-  membership, keeps the gate and its *Joined / Verify* button on screen, and tells the owner. This was
-  a real bug: with ids present but no admin rights every check came back "unknown", the required count
-  collapsed to zero, and the gate silently passed people who had joined nothing.
-- The deep-link check ignores the membership cache, so a stale result can never let someone in.
-- **The keyboard shows progress, in place.** Each *Joined / Verify* tap edits the very message the
-  button sits on — a channel that is joined **or has a join request on record** gets a `✓` and turns
-  green, the rest stay blue. So the member sees at a glance what is done and what is still missing,
-  without hunting for a new message.
-- **A join request is counted without asking Telegram.** `chat_join_request` is the bot's own record,
-  so it is trusted first — the channel is never queried for it. This matters: if the bot is not an
-  admin it cannot call `getChatMember` at all, and before this the request was ignored and the `✓`
-  never appeared.
-- **The gate message is deleted once you pass.** Both the message the button was on and the earlier
-  *5 links + Verify* message are removed (Telegram plays its own fade), and a short *Verified* line is
-  sent instead — nothing stale is left behind.
-- **Only the owner skips the gate.** The owner's `/start` is just the welcome — no channel buttons and
-  no *Joined / Verify*, and a `/post` deep link takes them straight to the download button. Admins and
-  members both see the five links with *Joined / Verify*.
-
-- `LINK_BLOCKS` groups the required chats so they can be shown as buttons in the join prompt. Those buttons are sent with `style="primary"` (blue) and the verify button with `style="success"` (green) — button colours need Telegram clients from after 9 Feb 2026; older clients ignore the style.
-- The verify button reads `GATE_BUTTON_TEXT` (default `Joined / Verify`).
-- Colours are sent through `api_kwargs` (`_btn()` in `bot.py`), not PTB's `style=` parameter — that parameter only exists from PTB 22.7, and on older versions the colour used to disappear silently. The `api_kwargs` route works on any PTB version.
-- **Every** button in the bot is coloured: the channel buttons, *Joined / Verify*, *Request to Join*,
-  *Download & Watch*, the post builder's type/channel/Done/Post now/Schedule buttons, the *Share*
-  button on `/ref`, and the Approve buttons.
-- Every keyboard is built through `_btn()`, so a button without a colour cannot be introduced by
-  accident. `/btnstyle` (owner only, kept out of the command list) prints the exact JSON the bot
-  sends, so the payload can be checked directly.
-- `style` needs **no** Telegram Premium and works in private chats, groups and supergroups alike —
-  the only requirement is a client released after 9 Feb 2026.
-- The startup log prints the real button payload, so you can see exactly what is being sent.
-- `MIN_JOINS_REQUIRED` sets how many of the listed chats must be joined or requested (`all` by default).
-- `JOIN_FAIL_MODE` defines what happens when the membership check can't be completed — for example, when the bot lacks permission to query membership or the Telegram API is unreachable. Two common modes are to fail open (allow access) or fail closed (deny access).
-- `/diag` reports the current state of the gate so misconfiguration can be spotted quickly.
-- `/getid` and `/setid` are used to discover and correct chat IDs used by the gate.
-  **Forward a message from the channel/group** and the bot replies with the numeric id — and binds it
-  automatically when the title matches a block. Owner and admins can also just forward the message
-  with no command at all. This reads the new `forward_origin` field; `forward_from_chat` was removed
-  in Bot API 7.0, which is why the old version silently never worked.
-- The command list is registered with `setMyCommands` at startup, so the commands appear in
-  Telegram's `/` menu — the member list by default, the admin list for each `ADMIN_IDS`, and every
-  command for the owner. Without this the commands exist but stay invisible.
-- `/help` descriptions are kept to **one short line** each. Long descriptions wrap to two or three
-  lines on a phone and make the whole list look cluttered. Argument hints (`/kick <user_id>`,
-  `/ai <question>`) live in a small footer instead of on every line.
-
-### The AI's instructions
-
-`AI_SYSTEM_PROMPT` tells the bot it is **Ongoing**, built by Deepak working alone — it never claims a
-team, company or studio, and never volunteers that it was "set up" or "installed" anywhere. It knows
-two links (`AI_BOT_LINK`, `COMMUNITY_LINK`) and is given concrete triggers for when to share them:
-
-- **Community** — when the user asks for more anime/episodes, a group or channel to join, where to
-  find more, or what the community is.
-- **AI** — when the user asks for another AI, more help, or a smarter assistant.
-
-On any other question it must not bring them up at all — not on a random or unrelated question, not
-as a footer or signature, never twice, at most once per chat, and never as a raw URL inside a
-welcome. If a link looks blocked it falls back to plain `t.me/...` text.
-
-The bot **replies in whatever language the user writes in** — Hinglish gets Hinglish, Hindi gets
-Hindi, English gets English. It mirrors the user rather than switching on its own.
-
-> **If you set `AI_SYSTEM_PROMPT` in your Render environment, it overrides this whole prompt** and
-> none of the above applies. The bot logs which one is in use at startup — look for `AI prompt:` in
-> the Render logs. Delete the env var if you want the built-in prompt.
-
-### How the bot learns a chat's ID
-
-Telegram has no API to list the chats a bot is in, so the bot learns each chat's ID from events:
-
-- **Added or re-promoted as admin** — the bot learns the ID instantly (`my_chat_member`). This is silent; nobody sees a message.
-- **Any channel post** — the bot receives it and learns the chat.
-- **Any group message** (text, photo, sticker, command) — the bot learns the chat.
-- **Someone joins the group** — a service message the bot always receives.
-- **A join request** — the bot learns the chat ID.
-
-The bot does **not** receive its own outgoing messages, so it cannot post its way into a chat it has no ID for. To make the bot learn a chat it has been in since before this feature existed: send any message there, or re-promote the bot. `/chats` lists every chat the bot knows, with its live status.
-
-Adding the bot to a group does not bypass the gate. Group members are subject to the same check as private users.
+**Network Access must include `0.0.0.0/0`.** Render's outbound IP is not fixed, so an allow-list of
+specific addresses will break on the next deploy.
 
 ---
 
-## Notes and Limits
+## Deploy on Render
 
-- **No auto-add.** The bot does not add users to any chat. Users join through the links configured in `LINK_BLOCKS`.
-- **Broadcast is opt-in for recipients.** Only users known to the bot receive broadcasts — the Bot API cannot list the members of a group or channel, so someone who has never started the bot cannot be reached.
-- **Data is local.** All state lives in `data/db.json`. The file is created on first run and is not part of the repository.
-- **Persistent storage is required in production.** On ephemeral filesystems, attach a persistent disk and point the database path at it.
-- **The webhook URL must be public.** The bot will not function correctly behind a URL that Telegram cannot reach.
+- **Build command:** `pip install -r requirements.txt`
+- **Start command:** `python bot.py` — note `bot.py`, not `bor.py`
+- **Health check path:** `/health`
+
+Set the seven variables above under Environment, then deploy. `render.yaml` is included for Blueprint
+deploys; with a normal Web Service Render ignores it and the Dashboard settings apply.
+
+After the first deploy, run `/diag` — it reports whether storage is connected and whether the gate is
+ready. `/mongo` runs a live connection test and prints the real reason if it fails, without ever
+printing the password.
+
+**Enable Guest Mode** in BotFather → Bot Settings. Without it the bot never receives guest mentions.
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Likely cause | Resolution |
+| Symptom | Cause | Fix |
 |---|---|---|
-| Bot does not respond at all | Webhook URL not set or unreachable | Set the Render service URL as the webhook and verify it is public |
-| Users pass the gate without joining | Bot lacks permission to check membership | Grant the bot the required permissions in each configured chat, then run `/diag` |
-| Users are always blocked | `MIN_JOINS_REQUIRED` higher than the number of configured chats | Lower the value or add the missing chat IDs |
-| Join buttons show wrong chats | `LINK_BLOCKS` or chat IDs are incorrect | Re-check IDs with `/getid` and update `config.py` |
-| Data resets after deploy | Ephemeral filesystem | Attach a persistent disk and set the database path to it |
-| No welcome in a channel | Telegram sends no "member joined" event for channels | This is a platform limit — channels only report *join requests* (`chat_join_request`), which the bot already handles. Welcomes work in groups and supergroups |
-| Welcome image missing | `welcome.png` not found from the working directory | The bot now searches the working directory, `assets/`, and the folder `bot.py` itself lives in, and falls back to a text-only welcome. Check the startup log for `Welcome image nahi mili` |
-| Buttons have no colour | An old Telegram client, or you are looking at an **old message** | Button colour is a **client** feature — Telegram silently ignores `style` on clients older than 9 Feb 2026, and old messages keep the keyboard they were sent with. Two checks: (1) run `/btnstyle` — it sends three action buttons *and* two link buttons, all coloured, and prints the exact JSON being sent; (2) open **https://web.telegram.org** and run `/btnstyle` there — Telegram Web is always the newest build, so coloured buttons there prove the phone app is the old one. Also send `/start` fresh rather than scrolling back |
-| Bot still behaves like an older version | `AI_SYSTEM_PROMPT` set in the environment overrides the built-in prompt | Delete `AI_SYSTEM_PROMPT` from the Render environment |
-| Every AI reply says "busy" | `AI_API_KEY` is missing | The startup log warns about this explicitly — set the key |
-| A command seems to do nothing | It is above your role | Member, admin and owner each see only their own commands in the `/` menu, and anything higher stays **silent** — the bot never reveals that a higher tier exists. Run `/help` to see what your role has |
-| `/getid` always asks you to forward | You sent `/getid` with nothing attached | Forward the channel message **first**, or reply to a forwarded message with `/getid` |
-| A channel shows "no chat ID yet" in `/stats` | The bot has no numeric ID for it | Add the bot as an admin there, or bind it with `/setid`. Only then can its member count be read |
-| Broadcast does not reach users | No known users yet, or the bot was blocked by recipients | Confirm recipient count with `/stats` |
+| `can't open file 'bor.py'` | Typo in the Start command | Set it to `python bot.py` |
+| `bad auth : Authentication failed` | Wrong password, or the Atlas account password instead of the database user's | Reset the **database user's** password, not your Atlas login |
+| `Username and password must be escaped` | An unescaped character in the URI | Use `MONGO_PASSWORD`; the bot encodes it |
+| `DNS query name does not exist` | Placeholder or typo in the host | Copy the host from Atlas, never type it |
+| Buttons have no colour | Telegram client older than 9 Feb 2026 | Button colour is a client feature; check on web.telegram.org |
+| A channel shows no member count | The bot is not an admin there | Make it an admin, or bind the ID with `/setid` |
 
 ---
 
-## Related projects
+## Notes and limits
 
-- **Linnet | AI Companion** — A Telegram AI bot with persistent memory, media understanding, and voice replies.
-  Repository: https://github.com/DeepakDevss/Linnet_AI_Telegram
-  Bot: https://t.me/Linnet_Agents_Bot
-
----
-
-## Author
-
-Deepak Devs
-
-- GitHub: https://github.com/DeepakDevss
-- X: https://x.com/Deepak_Devs
-- Reddit: https://www.reddit.com/u/Deepak_Devs
+- The bot cannot join a chat by itself. Telegram has no such method for bots.
+- A channel sends no "member joined" event, so welcomes work in groups only.
+- Conversation memory is per-process; it resets on restart.
+- On Render's free tier the service sleeps after about 15 minutes idle, so the first request after a
+  pause takes 30–50 seconds. A scheduled post may fire late for the same reason.
+- `gitignore.txt` in the repository is inert. The file must be named `.gitignore` for GitHub to apply
+  it; otherwise `.env` and `data/` can be committed.
 
 ---
 
 ## License
 
-There's no license file yet. Add one before you distribute or publicly modify this project.
+MIT — see [LICENSE](LICENSE).
