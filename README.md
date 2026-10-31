@@ -2,8 +2,8 @@
 
 A Telegram community bot that gates access behind channel membership, welcomes new members, answers messages with AI, sends join requests to the owner for approval, and grows through a referral system. Runs on Render as a webhook service.
 
-- Bot: https://t.me/ANIME_WORLD_8BOT
-- Repository: https://github.com/DeepakDevss/Ongoing_Links_Bot
+- Bot: https://t.me/AvenorOrbitBot
+- Repository: https://github.com/bydenvik/avenor-orbit-Bot
 
 ---
 
@@ -626,9 +626,9 @@ Adding the bot to a group does not bypass the gate. Group members are subject to
 
 ## Related projects
 
-- **Linnet | AI Companion** — A Telegram AI bot with persistent memory, media understanding, and voice replies.
-  Repository: https://github.com/DeepakDevss/Linnet_AI_Telegram
-  Bot: https://t.me/Linnet_Agents_Bot
+- **Avenor | AI Companion** — A Telegram AI bot with persistent memory, media understanding, and voice replies.
+  Repository: https://github.com/bydenvik/avenor-ai-telegram-bot
+  Bot: https://t.me/AvenorAIBot
 
 ---
 
@@ -636,9 +636,9 @@ Adding the bot to a group does not bypass the gate. Group members are subject to
 
 Deepak Devs
 
-- GitHub: https://github.com/DeepakDevss
-- X: https://x.com/Deepak_Devs
-- Reddit: https://www.reddit.com/u/Deepak_Devs
+- GitHub: https://github.com/bydenvik
+- X: https://x.com/bydenvik
+- Reddit: https://www.reddit.com/u/bydenvik
 
 ---
 
