@@ -69,7 +69,7 @@ MONGO_PASSWORD_STRIPPED = len(_MONGO_PW_RAW) - len(MONGO_PASSWORD)
 
 # (B) Purana tareeka — poora connection string.
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
-MONGO_DB = os.getenv("MONGO_DB", "ongoing_bot").strip() or "ongoing_bot"
+MONGO_DB = os.getenv("MONGO_DB", "avenor_orbit").strip() or "avenor_orbit"
 
 
 def _clean_host(h: str) -> str:
@@ -490,7 +490,7 @@ POST_CHANNELS = [
 
 # Post ke caption me credit line. "Ongoing" par click karne se ye link khulta hai.
 POST_CREDIT_TEXT = os.getenv("POST_CREDIT_TEXT", "Avenor Orbit")
-POST_CREDIT_URL = os.getenv("POST_CREDIT_URL", "https://t.me/ANIME_WORLD_8BOT")
+POST_CREDIT_URL = os.getenv("POST_CREDIT_URL", "https://t.me/AvenorOrbitBot")
 
 # Episode line ke dono taraf ye emoji lagta hai (jaise 🫧 S01 EPISODE 01 ADDED 🫧)
 POST_EP_EMOJI = os.getenv("POST_EP_EMOJI", "🫧")
