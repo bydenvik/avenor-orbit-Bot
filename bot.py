@@ -3051,11 +3051,25 @@ async def _ep_line(p) -> str:
                 line = t.strip().splitlines()[0].strip().strip('"').strip()
                 line = re.sub(r"(\d+)\s*-\s*\d+", r"\1", line)   # 01-02 -> 01
                 if line:
-                    return line[:60]
+                    return _trim_words(line, 60)
         except Exception:
             pass
     s = re.sub(r"\D", "", season)
     return f"S{s} EPISODE ADDED" if s else "NEW EPISODE ADDED"
+
+
+def _trim_words(s: str, limit: int) -> str:
+    """limit par kaato — par WORD ke beech me nahi. Aakhri space par kaat ke
+    '…' lagao. Pehle seedha s[:90] kar raha tha, jisse "AI re" jaisa aadha
+    shabd aa jata tha."""
+    s = (s or "").strip()
+    if len(s) <= limit:
+        return s
+    cut = s[:limit]
+    sp = cut.rfind(" ")
+    if sp > limit * 0.6:          # space bahut pehle na ho to hi wahin kaato
+        cut = cut[:sp]
+    return cut.rstrip(" ,.;:-·\n") + "…"
 
 
 def _post_caption(p, ep_line="", link_url="", text_links=True) -> str:
@@ -3072,17 +3086,28 @@ def _post_caption(p, ep_line="", link_url="", text_links=True) -> str:
             if k not in ("Link",) and p.get(k):
                 title = p.get(k); break
     out = [f"<blockquote>❝ {_esc(bd(str(title or '-')))} ❞</blockquote>", ""]
-    det = []
+    # Chhoti values ek saath inline jaati hain (►Version :- 1). Lambi ya
+    # multi-line values (jaise 6-line changelog) ko APNA block milta hai,
+    # apni line structure ke saath — pehle unhe 90 chars par kaat dete the
+    # aur shabd beech me toot jata tha ("...and scan it. · 2. AI re").
+    det, blocks = [], []
     for k in _post_lines(p.get("type")):
         v = p.get(k)
-        if v:
-            # Field me newline aane par blockquote ka layout toot jata hai
-            # (numbered list "►" prefix ke bahar chali jaati hai). Ek line me
-            # laao: newline -> " · ", phir 90 chars par kaato.
-            flat = " · ".join(x.strip() for x in str(v).splitlines() if x.strip())
-            det.append(f"►{k} :- {_esc(flat[:90])}")
+        if not v:
+            continue
+        raw = str(v).strip()
+        lines = [x.strip() for x in raw.splitlines() if x.strip()]
+        if len(lines) > 1 or len(raw) > 60:
+            body = "\n".join(lines)
+            blocks.append("<blockquote>►" + _esc(k) + ":\n"
+                          + _esc(_trim_words(body, 400)) + "</blockquote>")
+        else:
+            det.append(f"►{k} :- {_esc(raw)}")
     if det:
         out.append("<blockquote>" + "\n".join(det) + "</blockquote>")
+        out.append("")
+    for _blk in blocks:
+        out.append(_blk)
         out.append("")
     _ct = _esc(bd(POST_CREDIT_TEXT))
     if text_links:
