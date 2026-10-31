@@ -1,6 +1,6 @@
 """
 =====================================================================
-  bot.py — ONGOING BOT (poora bot ek hi file mein)
+  bot.py — AVENOR ORBIT (poora bot ek hi file mein)
 =====================================================================
   Isme sab kuch hai:
     • Database (users / referrals / ban)   -> section "DATABASE"
@@ -10,7 +10,7 @@
   Sirf "config.py" edit karni hai. Is file ko chhedne ki zaroorat nahi.
 
   Features:
-    1) Force-join gate (config.py ke LINK_BLOCKS se) + join requests Admin 1 ko
+    1) Force-join gate (config.py ke LINK_BLOCKS se) + join requests auto-approve
     2) Welcome message (photo + styled caption)
     3) AI chat — DM mein, aur group mein sirf @mention par (membership check ke saath)
     4) Referral / invite growth system
@@ -927,8 +927,8 @@ def _fuzzy_in(needle, hay, cutoff=0.8):
 def match_block_by_title(title):
     """Title ko LINK_BLOCKS ke naam se match karo.
     1) exact (normalized)   2) substring   3) token-based (naam thoda alag ho)
-    #3 isliye: block "ANIME WORLD HINDI" aur asli channel ka naam
-    "ANIME WORLD OFFICIAL HINDI DUBBED" — pehle ye bind hi nahi hota tha."""
+    #3 isliye: block ka naam config me chhota hota hai aur asli channel ka naam
+    lamba — pehle ye bind hi nahi hota tha."""
     t = _norm(title)
     if not t:
         return None
@@ -2917,7 +2917,7 @@ async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =====================================================================
 #  /POST  —  post builder (Owner/Admin) + deep-link tracking
 # =====================================================================
-#   Flow:  /post -> type (Anime/Movie/Series) -> CHANNEL buttons (multi-select
+#   Flow:  /post -> type (APK/Update/AI Tool/News/Tip) -> CHANNEL buttons (multi-select
 #          + Done) -> banner image (AI vision se padhi jaati hai, skip bhi kar
 #          sakte ho) -> fields (POST_FIELDS) -> abhi/schedule -> post.
 #   Post us/ un channels par image + caption + "Download" button ke saath
@@ -2995,7 +2995,7 @@ def _as_url(v) -> str:
 
 
 def _norm_chat_id(x):
-    """1002549849997 -> -1002549849997 (config me jo diya hai usko theek karo).
+    """1001111111111 -> -1001111111111 (config me jo diya hai usko theek karo).
     "@AvenorAppsAI" jaisa username waisa hi rehta hai — Telegram dono leta hai."""
     try:
         cid = int(x)
@@ -3014,7 +3014,7 @@ def _esc(t) -> str:
 
 
 def _post_fields(t) -> list:
-    """Us post TYPE ke fields (Anime/Movie/Series). Type na ho to default."""
+    """Us post TYPE ke fields (config.POST_FIELDS_BY_TYPE se). Type na ho to default."""
     return POST_FIELDS_BY_TYPE.get(str(t or "").strip()) or POST_FIELDS
 
 
@@ -3035,7 +3035,7 @@ async def _ep_line(p) -> str:
     if POST_EP_LINE:
         try:
             t = await ask_ai(
-                f"Anime: {p.get('Name', '')}. Season: {season}. "
+                f"{p.get('type') or 'Series'}: {p.get('Name', '')}. Season: {season}. "
                 "Write one short line in exactly this style: 'S03 EPISODE 01 ADDED'. "
                 "Use ONE episode number only — never a range like 01-02. "
                 "Only that line, nothing else, no markdown, no quotes.",
