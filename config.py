@@ -69,7 +69,7 @@ MONGO_PASSWORD_STRIPPED = len(_MONGO_PW_RAW) - len(MONGO_PASSWORD)
 
 # (B) Purana tareeka — poora connection string.
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
-MONGO_DB = os.getenv("MONGO_DB", "avenor_orbit").strip() or "avenor_orbit"
+MONGO_DB = os.getenv("MONGO_DB", "ongoing_bot").strip() or "ongoing_bot"
 
 
 def _clean_host(h: str) -> str:
@@ -456,7 +456,7 @@ AI_BUSY_MESSAGE = os.getenv("AI_BUSY_MESSAGE", (
 POST_COMMAND = os.getenv("POST_COMMAND", "post").lstrip("/")
 
 # Post ke type buttons (jo /post par dikhte hain)
-POST_TYPES = [x.strip() for x in os.getenv("POST_TYPES", "Anime,Movie,Series").split(",") if x.strip()]
+POST_TYPES = [x.strip() for x in os.getenv("POST_TYPES", "APK,Update,AI Tool,News,Tip").split(",") if x.strip()]
 
 # AI kin cheezon ka sawaal poochhega (channel uske BAAD poochha jata hai).
 # Ye DEFAULT hai — us type ke liye jo niche POST_FIELDS_BY_TYPE me na ho.
@@ -467,9 +467,25 @@ POST_FIELDS = [x.strip() for x in
 # isliye uske liye Year poochha jaata hai. Caption ki lines khud in fields se
 # banti hain (Name aur Link chhod ke).
 POST_FIELDS_BY_TYPE = {
-    "Anime":  ["Name", "Season", "Episodes", "Quality", "Language", "Link"],
-    "Movie":  ["Name", "Year", "Quality", "Language", "Link"],
-    "Series": ["Name", "Season", "Episodes", "Quality", "Language", "Link"],
+    # Har category ke apne fields. "Name" aur "Link" caption me alag jagah
+    # jaate hain, baaki sab detail lines banti hain.
+    "APK":     ["Name", "Version", "Size", "Android", "Link"],
+    "Update":  ["Name", "Version", "Whats New", "Link"],
+    "AI Tool": ["Name", "What It Does", "Pricing", "Link"],
+    "News":    ["Headline", "Summary", "Source", "Link"],
+    "Tip":     ["Title", "Tip", "Link"],
+    "Movie":   ["Name", "Year", "Quality", "Language", "Link"],
+    "Series":  ["Name", "Season", "Episodes", "Quality", "Language", "Link"],
+}
+
+# Har category ka badge (caption me "NEW APK" wali line). Jo yahan nahi hai
+# uske liye "NEW <TYPE> ADDED" chalta hai.
+POST_BADGE_BY_TYPE = {
+    "APK":     "NEW APK",
+    "Update":  "APP UPDATED",
+    "AI Tool": "NEW AI TOOL",
+    "News":    "AI NEWS",
+    "Tip":     "QUICK TIP",
 }
 
 # Post me jo button lagta hai — ye bot ka deep link kholta hai
@@ -483,9 +499,9 @@ JOIN_BUTTON_TEXT = os.getenv("JOIN_BUTTON_TEXT", "Request to Join")
 #   id POSITIVE do (jaise 1002549849997) — bot khud -1002549849997 bana lega.
 #   Ek hi row ke buttons saath aate hain. Chaho to badal lo.
 POST_CHANNELS = [
-    [("ANIME WORLD",      1002549849997), ("ANIME UNIVERES",   1002493856027)],
-    [("HOYOVERSE ANIMES", 1003894555958), ("WORLD NEWS",       1003910002446)],
-    [("ANIME CHAT GROUP", 1002842273870)],
+    # Post kahan jayega. @username bhi chalega (numeric id ki tarah) — bot
+    # us channel/group me ADMIN hona chahiye, warna post fail hoga.
+    [("Avenor Apps AI", "@AvenorAppsAI"), ("Avenor AI Community", "@AvenorAICommunity")],
 ]
 
 # Post ke caption me credit line. "Ongoing" par click karne se ye link khulta hai.

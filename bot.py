@@ -112,6 +112,7 @@ from config import (
     POST_TYPES,
     POST_FIELDS,
     POST_FIELDS_BY_TYPE,
+    POST_BADGE_BY_TYPE,
     POST_BUTTON_TEXT,
     JOIN_BUTTON_TEXT,
     GATE_MESSAGE,
@@ -2133,7 +2134,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not fl:
             await q.answer("Flow expired — send /post again.", show_alert=True)
             return
-        cid = int(data.split(":", 1)[1])
+        cid = _norm_chat_id(data.split(":", 1)[1])   # @username bhi chalega
         sel = fl.setdefault("channels", [])
         if cid in sel:
             sel.remove(cid)
@@ -2993,9 +2994,13 @@ def _as_url(v) -> str:
     return ""
 
 
-def _norm_chat_id(x) -> int:
-    """1002549849997 -> -1002549849997 (jo config me diya hai usko theek karo)."""
-    cid = int(x)
+def _norm_chat_id(x):
+    """1002549849997 -> -1002549849997 (config me jo diya hai usko theek karo).
+    "@AvenorAppsAI" jaisa username waisa hi rehta hai — Telegram dono leta hai."""
+    try:
+        cid = int(x)
+    except (TypeError, ValueError):
+        return str(x).strip()
     return cid if cid < 0 else -cid
 
 
@@ -3021,8 +3026,11 @@ def _post_lines(t) -> list:
 async def _ep_line(p) -> str:
     """'S03 EPISODE 01-02 ADDED' jaisi ek line — AI banata hai, warna season se."""
     if "Season" not in _post_fields(p.get("type")):
-        # Movie jaisa — "S03 EPISODE 01 ADDED" ka matlab nahi hota.
-        return f"NEW {str(p.get('type') or 'POST').upper()} ADDED"
+        # Jis type me Season nahi (APK / Update / News / Tip / Movie) usme
+        # "S03 EPISODE 01 ADDED" ka koi matlab nahi. Config ke badge map se
+        # seedha label lo, warna "<TYPE> ADDED".
+        t = str(p.get("type") or "Post")
+        return POST_BADGE_BY_TYPE.get(t) or f"NEW {t.upper()} ADDED"
     season = str(p.get("Season") or "").strip()
     if POST_EP_LINE:
         try:
@@ -3049,7 +3057,14 @@ def _post_caption(p, ep_line="", link_url="", text_links=True) -> str:
     link — wahi jo neeche wale button me hai)."""
     bd = fonts.bold
     sep = "━━━━━━━━━━━━━━━━━"
-    out = [f"<blockquote>❝ {_esc(bd(str(p.get('Name') or '-')))} ❞</blockquote>", ""]
+    # Title: "Name" field, aur jis category me Name nahi (News -> Headline,
+    # Tip -> Title) usme uska pehla field. Warna caption me "❝ - ❞" aata tha.
+    title = p.get("Name")
+    if not title:
+        for k in _post_fields(p.get("type")):
+            if k not in ("Link",) and p.get(k):
+                title = p.get(k); break
+    out = [f"<blockquote>❝ {_esc(bd(str(title or '-')))} ❞</blockquote>", ""]
     det = []
     for k in _post_lines(p.get("type")):
         v = p.get(k)
@@ -3516,7 +3531,7 @@ async def cmd_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     out = [bd("POSTS"), ""]
     for code, p in sorted(allp.items(), key=lambda kv: kv[1].get("created", ""), reverse=True)[:20]:
         st = "✅ posted" if p.get("posted") else ("🕒 " + str(p.get("post_at") or "draft"))
-        out.append(f"{bd(p.get('Name') or '-')}  [{p.get('type')}]")
+        out.append(f"{bd(p.get('Name') or '-')}")
         out.append(f"   {sc('code')} : {code}   {st}")
         out.append(f"   {sc('link')} : {_deep_link(context, code)}")
     await _send_long(update.effective_message, "\n".join(out))
