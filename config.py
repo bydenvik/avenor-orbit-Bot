@@ -482,20 +482,24 @@ POST_FIELDS_BY_TYPE = {
 # uske liye "NEW <TYPE> ADDED" chalta hai.
 # Har category ka apna button label. Jo yahan nahi hai uske liye
 # POST_BUTTON_TEXT chalta hai ("Download & Watch").
+# Button ka label. Chhota rakha hai taaki log jaldi padh kar click karein.
+# Button ka label — chhota, action wala, aur badge se ALAG (warna dono ek hi
+# baat kehte hain: "UPDATE LIVE" + "Update").
 POST_BUTTON_BY_TYPE = {
-    "APK":     "DOWNLOAD APK",
-    "Update":  "GET THE UPDATE",
-    "AI Tool": "OPEN THE TOOL",
-    "News":    "READ MORE",
-    "Tip":     "READ THE TIP",
+    "APK":     "Download",
+    "Update":  "Get it",
+    "AI Tool": "Try it",
+    "News":    "Read more",
+    "Tip":     "Read more",
 }
 
+# Caption me end wali badge line. Chhoti aur professional.
 POST_BADGE_BY_TYPE = {
-    "APK":     "NEW APK",
-    "Update":  "APP UPDATED",
-    "AI Tool": "NEW AI TOOL",
-    "News":    "AI NEWS",
-    "Tip":     "QUICK TIP",
+    "APK":     "NEW RELEASE",
+    "Update":  "UPDATE LIVE",
+    "AI Tool": "NEW TOOL",
+    "News":    "NEWS",
+    "Tip":     "TIP",
 }
 
 # Post me jo button lagta hai — ye bot ka deep link kholta hai

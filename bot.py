@@ -3077,7 +3077,6 @@ def _post_caption(p, ep_line="", link_url="", text_links=True) -> str:
     Ep line aur WATCH & DOWNLOAD dono `link_url` par jaate hain (bot ka deep
     link — wahi jo neeche wale button me hai)."""
     bd = fonts.bold
-    sep = "━━━━━━━━━━━━━━━━━"
     # Title: "Name" field, aur jis category me Name nahi (News -> Headline,
     # Tip -> Title) usme uska pehla field. Warna caption me "❝ - ❞" aata tha.
     title = p.get("Name")
@@ -3085,7 +3084,9 @@ def _post_caption(p, ep_line="", link_url="", text_links=True) -> str:
         for k in _post_fields(p.get("type")):
             if k not in ("Link",) and p.get(k):
                 title = p.get(k); break
-    out = [f"<blockquote>❝ {_esc(bd(str(title or '-')))} ❞</blockquote>", ""]
+    # Telegram ka blockquote khud ek quote-mark dikhata hai. Uske upar
+    # "❝ ❞" lagane se double quotes ho jaate the — isliye hata diye.
+    out = [f"<blockquote>{_esc(bd(str(title or '-')))}</blockquote>", ""]
     # Chhoti values ek saath inline jaati hain (►Version :- 1). Lambi ya
     # multi-line values (jaise 6-line changelog) ko APNA block milta hai,
     # apni line structure ke saath — pehle unhe 90 chars par kaat dete the
@@ -3116,26 +3117,24 @@ def _post_caption(p, ep_line="", link_url="", text_links=True) -> str:
     else:
         out.append(f"<blockquote>[ Credit - {_ct} ]</blockquote>")
     out.append("")
+    # ── End block ───────────────────────────────────────────────────────
+    # Pehle har line ke upar-neeche "━━━" separator tha, aur badge + CTA
+    # beech me pade rehte the. Ab dono lines ek saath, sabse NEECHE, bina
+    # separator ke — user ek nazar me padh ke click kar sake.
+    _bl = POST_BUTTON_BY_TYPE.get(str(p.get("type") or ""), POST_BUTTON_TEXT)
     if link_url and text_links:
         if ep_line:
-            out.append(sep)
             em = f"{POST_EP_EMOJI} " if POST_EP_EMOJI else ""
             tail = f" {POST_EP_EMOJI}" if POST_EP_EMOJI else ""
-            out.append(f'   {em}<a href="{_esc(link_url)}">{_esc(bd(ep_line))}</a>{tail}')
-        out.append(sep)
-        _bl = POST_BUTTON_BY_TYPE.get(str(p.get("type") or ""), POST_BUTTON_TEXT)
-        out.append(f'   ★ <a href="{_esc(link_url)}">{_esc(bd(_bl))}</a> ★')
-        out.append(sep)
+            out.append(f'{em}<a href="{_esc(link_url)}">{_esc(bd(ep_line))}</a>{tail}')
+        out.append(f'<a href="{_esc(link_url)}">{_esc(bd(_bl))}</a>')
     elif ep_line or link_url:
         if ep_line:
-            out.append(sep)
             em = f"{POST_EP_EMOJI} " if POST_EP_EMOJI else ""
             tail = f" {POST_EP_EMOJI}" if POST_EP_EMOJI else ""
-            out.append(f"   {em}{_esc(bd(ep_line))}{tail}")
+            out.append(f"{em}{_esc(bd(ep_line))}{tail}")
         if link_url:
-            out.append(sep)
-            out.append(f"   ★ {_esc(bd('WATCH & DOWNLOAD'))} ★")
-        out.append(sep)
+            out.append(_esc(bd(_bl)))
     return "\n".join(out)
 
 
@@ -3414,7 +3413,8 @@ async def _send_post(context, code):
     if not p:
         return False
     kb = InlineKeyboardMarkup([[_btn(
-        POST_BUTTON_TEXT, url=_deep_link(context, code), style="primary")]])
+        POST_BUTTON_BY_TYPE.get(str(p.get("type") or ""), POST_BUTTON_TEXT),
+        url=_deep_link(context, code), style="primary")]])
     ep = p.get("ep_line") or await _ep_line(p)
     deep = _deep_link(context, code)
     cap = _fit_caption(_post_caption(p, ep, deep))
