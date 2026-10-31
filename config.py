@@ -480,6 +480,16 @@ POST_FIELDS_BY_TYPE = {
 
 # Har category ka badge (caption me "NEW APK" wali line). Jo yahan nahi hai
 # uske liye "NEW <TYPE> ADDED" chalta hai.
+# Har category ka apna button label. Jo yahan nahi hai uske liye
+# POST_BUTTON_TEXT chalta hai ("Download & Watch").
+POST_BUTTON_BY_TYPE = {
+    "APK":     "DOWNLOAD APK",
+    "Update":  "GET THE UPDATE",
+    "AI Tool": "OPEN THE TOOL",
+    "News":    "READ MORE",
+    "Tip":     "READ THE TIP",
+}
+
 POST_BADGE_BY_TYPE = {
     "APK":     "NEW APK",
     "Update":  "APP UPDATED",

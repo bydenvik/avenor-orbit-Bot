@@ -113,6 +113,7 @@ from config import (
     POST_FIELDS,
     POST_FIELDS_BY_TYPE,
     POST_BADGE_BY_TYPE,
+    POST_BUTTON_BY_TYPE,
     POST_BUTTON_TEXT,
     JOIN_BUTTON_TEXT,
     GATE_MESSAGE,
@@ -3075,16 +3076,20 @@ def _post_caption(p, ep_line="", link_url="", text_links=True) -> str:
     for k in _post_lines(p.get("type")):
         v = p.get(k)
         if v:
-            det.append(f"►{k} :- {_esc(str(v)[:80])}")
+            # Field me newline aane par blockquote ka layout toot jata hai
+            # (numbered list "►" prefix ke bahar chali jaati hai). Ek line me
+            # laao: newline -> " · ", phir 90 chars par kaato.
+            flat = " · ".join(x.strip() for x in str(v).splitlines() if x.strip())
+            det.append(f"►{k} :- {_esc(flat[:90])}")
     if det:
         out.append("<blockquote>" + "\n".join(det) + "</blockquote>")
         out.append("")
     _ct = _esc(bd(POST_CREDIT_TEXT))
     if text_links:
-        out.append('<blockquote>[ Creadit - <a href="' + _esc(POST_CREDIT_URL)
+        out.append('<blockquote>[ Credit - <a href="' + _esc(POST_CREDIT_URL)
                    + '">' + _ct + "</a> ]</blockquote>")
     else:
-        out.append(f"<blockquote>[ Creadit - {_ct} ]</blockquote>")
+        out.append(f"<blockquote>[ Credit - {_ct} ]</blockquote>")
     out.append("")
     if link_url and text_links:
         if ep_line:
@@ -3093,7 +3098,8 @@ def _post_caption(p, ep_line="", link_url="", text_links=True) -> str:
             tail = f" {POST_EP_EMOJI}" if POST_EP_EMOJI else ""
             out.append(f'   {em}<a href="{_esc(link_url)}">{_esc(bd(ep_line))}</a>{tail}')
         out.append(sep)
-        out.append(f'   ★ <a href="{_esc(link_url)}">{_esc(bd("WATCH & DOWNLOAD"))}</a> ★')
+        _bl = POST_BUTTON_BY_TYPE.get(str(p.get("type") or ""), POST_BUTTON_TEXT)
+        out.append(f'   ★ <a href="{_esc(link_url)}">{_esc(bd(_bl))}</a> ★')
         out.append(sep)
     elif ep_line or link_url:
         if ep_line:
@@ -3251,11 +3257,16 @@ async def _post_ask(chat_id, context, uid):
     ]])
     chans = ", ".join(str(c) for c in (fl.get("channels") or []))
     img = "✅" if fl.get("image") else "—"
+    _lnk = (preview.get("Link") or "").strip()
+    _lnk_line = (f"{fonts.small_caps('link')}: {_lnk}\n"
+                 f"{fonts.small_caps('goes to')}: {JOIN_BUTTON_TEXT} button "
+                 f"({fonts.small_caps('not in the caption')})") if _lnk else \
+                f"{fonts.small_caps('link')}: -"
     await context.bot.send_message(
         chat_id,
         f"{fonts.bold('PREVIEW')}\n\n{_post_caption(preview, fl['ep_line'], 'https://t.me/' + str(context.bot.username))}"
         f"\n\n{fonts.small_caps('channels')}: {chans}\n"
-        f"{fonts.small_caps('image')}: {img}",
+        f"{fonts.small_caps('image')}: {img}\n{_lnk_line}",
         reply_markup=kb, parse_mode="HTML")
 
 
