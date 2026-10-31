@@ -30,7 +30,8 @@ import json
 import hmac
 import copy
 import logging
-from urllib.parse import quote
+from urllib.parse import (quote, urlsplit, urlunsplit,
+                           parse_qsl, urlencode)
 import os
 import random
 import re
@@ -1459,6 +1460,7 @@ _COMMANDS = [
     ("promote",    "make someone an admin",            "admin"),
     ("POSTCMD",    "build a channel post",             "admin"),
     ("posts",      "list your posts",                  "admin"),
+    ("links",      "saved links, duplicates merged",   "owner"),
     ("stats",     "bot and community overview",        "owner"),
     ("diag",      "setup check: gate, IDs, perms",     "owner"),
     ("mongo",     "test the MongoDB connection",       "owner"),
@@ -2943,6 +2945,83 @@ _gate_msg: dict = {}
 _POSTS_KEEP = 200       # sirf itne posts rakho (Mongo doc 16 MB limit)
 
 
+# =====================================================================
+#  LINK REGISTRY  —  ek hi link do baar save na ho
+# =====================================================================
+def _norm_link(url) -> str:
+    """Link ko normalize karo taaki same link EK maana jaye.
+    - scheme/host lowercase, www. hatao
+    - trailing slash hatao
+    - tracking params (utm_*, fbclid, gclid, si, igshid) hatao
+    Iske bina "https://X.com/a/" aur "http://www.x.com/a?utm_source=tg" do
+    alag links ban jaate hain aur memory bekaar bharti hai."""
+    u = str(url or "").strip()
+    if not u:
+        return ""
+    if not u.lower().startswith(("http://", "https://")):
+        u = "https://" + u
+    try:
+        s = urlsplit(u)
+    except Exception:
+        return u.lower()
+    host = (s.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    drop = ("fbclid", "gclid", "si", "igshid", "mc_cid", "mc_eid")
+    q = [(k, v) for k, v in parse_qsl(s.query, keep_blank_values=True)
+         if not k.lower().startswith("utm_") and k.lower() not in drop]
+    path = s.path.rstrip("/") or "/"
+    return urlunsplit(("https", host, path, urlencode(q), ""))
+
+
+def db_link_add(url, note="") -> tuple:
+    """Link save karo. Pehle se hai to WAHI wapas — naya entry nahi banta.
+    Returns (key, created)."""
+    key = _norm_link(url)
+    if not key:
+        return "", False
+    with _db_lock:
+        d = _db_load()
+        links = d.setdefault("links", {})
+        hit = links.get(key)
+        if hit:
+            hit["uses"] = int(hit.get("uses", 1)) + 1
+            hit["last"] = _now()
+            if note and not hit.get("note"):
+                hit["note"] = note
+            _db_save(d)
+            return key, False
+        links[key] = {"url": str(url).strip(), "note": note or "",
+                      "uses": 1, "first": _now(), "last": _now()}
+        _db_save(d)
+        return key, True
+
+
+def db_links() -> dict:
+    return dict(_db_load().get("links", {}))
+
+
+def db_links_dedupe() -> int:
+    """Purani entries ko normalize karke duplicate hatao — ek hi rakho.
+    (Registry se pehle jo links save hue the unke liye.)"""
+    with _db_lock:
+        d = _db_load()
+        links = d.get("links") or {}
+        seen, keep, removed = {}, {}, 0
+        for key, v in links.items():
+            nk = _norm_link(v.get("url") or key) or key
+            if nk in seen:
+                keep[seen[nk]]["uses"] = int(keep[seen[nk]].get("uses", 1)) + int(v.get("uses", 1))
+                removed += 1
+            else:
+                seen[nk] = nk
+                keep[nk] = dict(v)
+        if removed:
+            d["links"] = keep
+            _db_save(d)
+        return removed
+
+
 def db_post_save(code, data):
     with _db_lock:
         d = _db_load()
@@ -3121,20 +3200,15 @@ def _post_caption(p, ep_line="", link_url="", text_links=True) -> str:
     # Pehle har line ke upar-neeche "━━━" separator tha, aur badge + CTA
     # beech me pade rehte the. Ab dono lines ek saath, sabse NEECHE, bina
     # separator ke — user ek nazar me padh ke click kar sake.
-    _bl = POST_BUTTON_BY_TYPE.get(str(p.get("type") or ""), POST_BUTTON_TEXT)
-    if link_url and text_links:
-        if ep_line:
-            em = f"{POST_EP_EMOJI} " if POST_EP_EMOJI else ""
-            tail = f" {POST_EP_EMOJI}" if POST_EP_EMOJI else ""
+    # CTA line caption me NAHI — neeche button me wahi label hota hai, aur
+    # dono jagah dikhne se "Get it" do baar aata tha. Caption me sirf badge.
+    if ep_line:
+        em = f"{POST_EP_EMOJI} " if POST_EP_EMOJI else ""
+        tail = f" {POST_EP_EMOJI}" if POST_EP_EMOJI else ""
+        if link_url and text_links:
             out.append(f'{em}<a href="{_esc(link_url)}">{_esc(bd(ep_line))}</a>{tail}')
-        out.append(f'<a href="{_esc(link_url)}">{_esc(bd(_bl))}</a>')
-    elif ep_line or link_url:
-        if ep_line:
-            em = f"{POST_EP_EMOJI} " if POST_EP_EMOJI else ""
-            tail = f" {POST_EP_EMOJI}" if POST_EP_EMOJI else ""
+        else:
             out.append(f"{em}{_esc(bd(ep_line))}{tail}")
-        if link_url:
-            out.append(_esc(bd(_bl)))
     return "\n".join(out)
 
 
@@ -3341,7 +3415,17 @@ async def _post_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- normal field ---
     fields = _post_fields(fl["type"])
     if fl["step"] < len(fields):
-        fl["data"][fields[fl["step"]]] = "" if txt.lower() == "skip" else txt
+        _field = fields[fl["step"]]
+        _val = "" if txt.lower() == "skip" else txt
+        fl["data"][_field] = _val
+        # Link field -> registry me bhi save (dedup ke saath). Wahi link
+        # dobara aaya to naya entry NAHI banta, sirf uses badh jata hai.
+        if _field == "Link" and _val:
+            try:
+                _lk, _new = db_link_add(_val, fl.get("type") or "")
+                log.info("Link %s: %s", "saved" if _new else "reused", _lk)
+            except Exception as e:
+                log.warning("Link registry fail: %s", e)
         fl["step"] += 1
         await _post_ask(update.effective_chat.id, context, uid)
         return
@@ -3561,6 +3645,34 @@ async def cmd_btnstyle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb)
 
 
+async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner: saare saved links. Duplicate ho to pehle dedupe karta hai."""
+    if not await _need_owner(update):
+        return
+    sc, bd = fonts.small_caps, fonts.bold
+    _removed = db_links_dedupe()
+    links = db_links()
+    out = [bd("SAVED LINKS"), ""]
+    if _removed:
+        out += [f"{sc('duplicates removed')}: {bd(str(_removed))}", ""]
+    if not links:
+        out.append(sc("no links saved yet"))
+        await _send_long(update.effective_message, "\n".join(out))
+        return
+    out.append(f"{sc('total')}: {bd(str(len(links)))}")
+    out.append("")
+    items = sorted(links.items(), key=lambda kv: kv[1].get("last", ""), reverse=True)
+    for k, v in items[:40]:
+        out.append(f"{bd(k)}")
+        out.append(f"   {sc('uses')}: {v.get('uses', 1)}   {sc('last')}: {v.get('last', '-')}")
+        if v.get("note"):
+            out.append(f"   {sc('type')}: {v['note']}")
+    if len(items) > 40:
+        out.append("")
+        out.append(sc(f"...and {len(items) - 40} more"))
+    await _send_long(update.effective_message, "\n".join(out))
+
+
 async def cmd_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: bane hue posts ki list."""
     if not is_privileged(update.effective_user.id):
@@ -3616,6 +3728,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("promote", cmd_promote))
     app.add_handler(CommandHandler("ai", cmd_ai))
     app.add_handler(CommandHandler(POST_COMMAND, cmd_post))
+    app.add_handler(CommandHandler("links", cmd_links))
     app.add_handler(CommandHandler("posts", cmd_posts))
     app.add_handler(CommandHandler("btnstyle", cmd_btnstyle))
 
