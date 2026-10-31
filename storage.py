@@ -59,6 +59,7 @@ from bson import BSON
 
 from config import (
     DB_PATH,
+    LOCAL_DISK_PERSISTENT,
     MONGO_DB,
     MONGO_ENABLED,
     MONGO_HOST,
@@ -120,12 +121,28 @@ def is_ready() -> bool:
     return _state == State.READY
 
 
-def is_durable() -> bool:
-    """Data kahin TIKA hua hai? READY = Mongo, DEGRADED = local disk.
-    Dono me se kuch bhi na ho to False (aur tab alert jata hai)."""
+# Durability ke 4 level — "haan/nahi" se kaam nahi chalta tha (audit AV-003).
+DURABILITY_MONGO = "MONGO"                  # Mongo me — restart ke baad bacha
+DURABILITY_DISK = "PERSISTENT_DISK"         # asli disk (VPS) — bacha rahega
+DURABILITY_EPHEMERAL = "EPHEMERAL"          # Render Free ka disk — redeploy par ud jayega
+DURABILITY_NONE = "VOLATILE"                # kuch bhi disk par nahi
+
+
+def durability() -> str:
+    """Data SACH ME kahan tika hai. Pehle is_durable() local write ko hi
+    durable maan leta tha — Render Free ke ephemeral disk par wo jhoot tha,
+    aur /ready 200 deta rehta tha jabki redeploy par data jaana tha."""
     if _state == State.READY:
-        return True
-    return bool(_last_local_ok) and not _local_write_failed
+        return DURABILITY_MONGO
+    if not (_last_local_ok and not _local_write_failed):
+        return DURABILITY_NONE
+    return DURABILITY_DISK if LOCAL_DISK_PERSISTENT else DURABILITY_EPHEMERAL
+
+
+def is_durable() -> bool:
+    """Restart ke baad bachega? Sirf Mongo ya asli disk par haan.
+    Ephemeral local file = kaam chalau, durable nahi."""
+    return durability() in (DURABILITY_MONGO, DURABILITY_DISK)
 
 
 def set_alert_hook(fn):
@@ -177,6 +194,7 @@ def health() -> dict:
     """/health aur /diag ke liye ek hi jagah se sach."""
     return {
         "state": _state,
+        "durability": durability(),
         "durable": is_durable(),
         "mongo_enabled": MONGO_ENABLED,
         "dirty": _dirty,
@@ -253,18 +271,27 @@ def db_load() -> dict:
     return _db_cache
 
 
+# Do jagah se likha jata hai: background writer thread, aur (kabhi-kabhi)
+# flush_local_now — privacy deletion / shutdown par. Dono ek hi .tmp file
+# use karte hain, isliye ek saath chalne par ek doosre ka tmp uda deta tha:
+#   os.replace(...) -> FileNotFoundError: db.json.tmp
+# (Ye asli bug test ne pakda, jab AV-005 ka commit_now add hua.)
+_json_write_lock = threading.Lock()
+
+
 def db_write_json(data) -> bool:
     """Local JSON file likho. Disk full / permission error par CRASH na ho.
     os.replace + fsync = aadhi likhi file kabhi nahi banti."""
     global _last_local_ok, _local_write_failed
     try:
         os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-        tmp = DB_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, DB_PATH)
+        with _json_write_lock:
+            tmp = DB_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, DB_PATH)
         _last_local_ok = time.time()
         _local_write_failed = False
         return True
@@ -277,28 +304,86 @@ def db_write_json(data) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------
+#  JSON WRITER THREAD  (audit AV-02 — event loop block na ho)
+# ---------------------------------------------------------------------
+#  DEGRADED mode me har write ko disk par fsync karna padta hai. Wo kaam
+#  ~5-100ms leta hai, aur pehle wo EVENT LOOP ke thread me hota tha (aur
+#  upar se _db_lock pakde hue) — matlab ek write ke dauraan bot ke saare
+#  doosre kaam ruk jaate the: doosri chats, /health, webhook.
+#  Ab ek hi background thread likhta hai, aur sirf LATEST snapshot (purane
+#  snapshot bekaar hain — state poora replace hota hai).
+_writer_slot: list = []
+_writer_event = threading.Event()
+_writer_thread = None
+_writer_writes = 0
+
+
+def _writer_loop():
+    global _writer_writes
+    while True:
+        _writer_event.wait()
+        _writer_event.clear()
+        data = _writer_slot.pop() if _writer_slot else None
+        if data is None:
+            continue
+        if db_write_json(data):
+            _writer_writes += 1
+
+
+def _ensure_writer():
+    global _writer_thread
+    if _writer_thread is not None and _writer_thread.is_alive():
+        return
+    _writer_thread = threading.Thread(target=_writer_loop, name="json-writer",
+                                      daemon=True)
+    _writer_thread.start()
+
+
+def _queue_json_write(data) -> None:
+    """Latest snapshot writer ko do. Purana snapshot phenk do — state poora
+    replace hota hai, isliye sirf aakhri wala matlab rakhta hai."""
+    _writer_slot.clear()
+    _writer_slot.append(data)
+    _ensure_writer()
+    _writer_event.set()
+
+
+def flush_local_now() -> bool:
+    """Abhi, isi thread par JSON likho (fsync ke saath).
+
+    Do jagah chahiye: shutdown par (aakhri baar), aur jab kuch aisa hua ho
+    jise user ko "ho gaya" bolne se pehle disk par chahiye (privacy deletion).
+    Async code se isse `asyncio.to_thread(...)` me hi bulana — warna event
+    loop ruk jayega (wahi AV-02 galti).
+    """
+    return db_write_json(db_load())
+
+
+def pending_json_write() -> bool:
+    """Koi write queue me padi hai? (shutdown se pehle dekhne ke liye)"""
+    return bool(_writer_slot)
+
+
 def db_save(data) -> None:
     """State save karo.
 
     • READY      -> memory + dirty flag. Background flush Mongo me likhta hai.
                     (Per-write JSON nahi — wo ~77ms leta tha.)
-    • DEGRADED   -> memory + TURANT local JSON (fsync).
-                    Ye DB-01 ka asli fix hai: pehle yahan sirf dirty flag
-                    lagta tha aur data RAM me hi pada rehta tha.
+    • DEGRADED   -> memory + local JSON, ek background writer thread par.
+                    Disk par likhna event loop me NAHI hota (AV-02), par
+                    write turant queue hoti hai — data RAM me nahi rehta.
     """
     global _db_cache, _dirty, _pending_push_full
     _db_cache = data
     if _state == State.READY:
         _dirty = True
         return
-    # Mongo ke bina: local disk par hi sahi, TIKAO.
-    ok = db_write_json(data)
     if MONGO_ENABLED:
         # Wapas connect hone par ye (naya) state Mongo par chadhna chahiye,
         # purana remote state nahi.
         _pending_push_full = True
-        if not ok:
-            log.error("DEGRADED aur local write bhi fail — ye data RAM me hai.")
+    _queue_json_write(data)
 
 
 # =====================================================================
@@ -358,11 +443,42 @@ def mongo_error_hint(e) -> str:
 
 
 def _doc(data) -> dict:
-    """State ko Mongo document banao (top-level keys, plus _id)."""
+    """State ko Mongo document banao (top-level keys, plus _id).
+
+    Update-dedupe ring bhi saath jaati hai (audit AV-004). Pehle wo sirf
+    memory me thi: process crash ho jaye side effect ke baad par Telegram ko
+    200 milne se pehle, to restart par guard khaali hota aur wahi update
+    DOBARA chal jata. Ab last 500 ids document ke saath hi save hote hain.
+    """
     doc = {k: v for k, v in data.items() if k != "_id"}
     doc["_id"] = _MONGO_DOC_ID
     doc["_saved"] = _now()
+    if _seen_updates:
+        # BSON me keys SIRF string ho sakti hain — int key par encode fail
+        # hota hai, isliye stringify karke likhte hain.
+        doc["_seen_updates"] = {str(k): v for k, v in list(_seen_updates.items())[-500:]}
     return doc
+
+
+def _restore_dedupe(doc) -> None:
+    """Saved dedupe ring wapas memory me (TTL ke andar wale hi)."""
+    raw = doc.get("_seen_updates") or {}
+    now = time.time()
+    for key, ts in raw.items():
+        try:
+            uid, when = int(key), float(ts)
+        except (TypeError, ValueError):
+            continue
+        if now - when <= UPDATE_DEDUPE_TTL:
+            _seen_updates[uid] = when
+
+
+def _write_mirror() -> None:
+    """Local JSON safety copy (fsync ke bina) — thread me chalta hai."""
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    with open(DB_PATH + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(db_load(), f, ensure_ascii=False)
+    os.replace(DB_PATH + ".tmp", DB_PATH)
 
 
 def doc_size_bytes(data) -> int:
@@ -446,6 +562,9 @@ async def connect() -> bool:
             if doc:
                 doc.pop("_id", None)
                 doc.pop("_saved", None)
+                # Update-dedupe ring restart ke baad bhi kaam kare (AV-004).
+                _restore_dedupe(doc)
+                doc.pop("_seen_updates", None)
                 base = db_default()
                 base.update(doc)
                 _db_cache = base
@@ -482,6 +601,24 @@ def _schedule_retry():
     log.info("MongoDB retry #%s, %ss baad.", _reconnect_attempt, delay)
 
 
+def _snapshot_for_write():
+    """Write ke liye copy + size check + (zaroorat par) prune.
+
+    Ye sab CPU-heavy hai (deepcopy + BSON encode of a multi-MB doc), isliye
+    event loop par NAHI — `asyncio.to_thread` se chalaya jata hai.
+    Returns (data, size_before, notes).
+    """
+    # deepcopy ZAROORI hai: db_load() live dict deta hai jise handlers usi
+    # waqt badal rahe hote hain. Bina copy ke driver encode karte waqt
+    # "dictionary changed size during iteration" aa sakta hai.
+    data = copy.deepcopy(db_load())
+    size = doc_size_bytes(data)
+    notes = []
+    if size > STORAGE_DOC_LIMIT_BYTES:
+        notes = _shrink(data)
+    return data, size, notes
+
+
 async def flush(force: bool = False) -> bool:
     """Dirty ho to poori state Mongo me likh do."""
     global _dirty, _last_ok, _last_err
@@ -491,15 +628,10 @@ async def flush(force: bool = False) -> bool:
         return False
     _dirty = False
     try:
-        # deepcopy ZAROORI hai: db_load() live dict deta hai jise handlers
-        # usi waqt badal rahe hote hain. Bina copy ke driver encode karte waqt
-        # "dictionary changed size during iteration" aa sakta hai.
-        data = copy.deepcopy(db_load())
+        data, size, notes = await asyncio.to_thread(_snapshot_for_write)
 
-        size = doc_size_bytes(data)
         if size > STORAGE_ALERT_BYTES:
             if size > STORAGE_DOC_LIMIT_BYTES:
-                notes = _shrink(data)
                 new_size = doc_size_bytes(data)
                 await _alert(
                     "⚠️ Storage document 16 MB limit ke paas pahunch gaya tha "
@@ -574,13 +706,10 @@ async def loop():
 
             if now - last_mirror > STORAGE_MIRROR_EVERY:
                 last_mirror = now
-                # Mongo hi asli store hai — ye sirf safety copy (fsync ke bina,
-                # kyunki degraded mode me to har write fsync ke saath jati hai).
+                # Mongo hi asli store hai — ye sirf safety copy. Disk par
+                # likhna thread me, taaki event loop na ruke (AV-02).
                 try:
-                    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-                    with open(DB_PATH + ".tmp", "w", encoding="utf-8") as f:
-                        json.dump(db_load(), f, ensure_ascii=False)
-                    os.replace(DB_PATH + ".tmp", DB_PATH)
+                    await asyncio.to_thread(_write_mirror)
                 except Exception as e:
                     log.warning("Local mirror fail: %s", e)
         except asyncio.CancelledError:
@@ -589,15 +718,43 @@ async def loop():
             log.warning("storage loop error: %s", e)
 
 
+async def commit_now() -> tuple[bool, str]:
+    """State ko TURANT durable karo (privacy deletion ke liye — audit AV-005).
+
+    Pehle deletion sirf memory + dirty flag thi, aur user ko "delete ho gaya"
+    bol diya jata tha. Us 5 second ke window me crash hua to record Mongo me
+    pada reh jata — matlab jhoot. Ab commit karke sach batate hain.
+
+    Returns (ok, kahan) — kahan: "mongo" | "disk" | "failed".
+    """
+    if MONGO_ENABLED and _state == State.READY:
+        ok = await flush(force=True)
+        return ok, ("mongo" if ok else "failed")
+    ok = await asyncio.to_thread(flush_local_now)
+    return ok, ("disk" if ok else "failed")
+
+
+def user_present(uid) -> bool:
+    """Delete ke baad verify karne ke liye."""
+    with _db_lock:
+        return str(int(uid)) in db_load().get("users", {})
+
+
+async def doc_size_now() -> int:
+    """Abhi ka document size (bytes). /diag dikhata hai."""
+    return await asyncio.to_thread(doc_size_bytes, db_load())
+
+
 async def close():
     """Shutdown: aakhri flush. State CLOSED."""
     if MONGO_ENABLED and _state == State.READY:
         ok = await flush(force=True)
         log.info("Shutdown: MongoDB final save %s.", "OK" if ok else "FAIL")
     elif MONGO_ENABLED:
-        # Degraded tha — memory ka state local file par hai (db_save ne likh diya).
-        db_write_json(db_load())
-        log.info("Shutdown: DEGRADED tha — state local file par likh diya.")
+        # Degraded tha — memory ka state local file par likh do (thread me,
+        # taaki shutdown bhi event loop ko block na kare).
+        ok = await asyncio.to_thread(flush_local_now)
+        log.info("Shutdown: DEGRADED tha — local file par likh diya: %s.", ok)
     _set_state(State.CLOSED)
 
 
@@ -1216,6 +1373,12 @@ def delete_user_data(uid) -> dict:
         d["audit"] = [a for a in journal
                       if str(a.get("actor")) != key and str(a.get("target")) != key]
         out["audit"] = before - len(d["audit"])
+        # Bachi hui entries me bhi iska id text me na bacha rahe (audit AV-03):
+        # detail me kabhi message text ya id chipak sakti hai.
+        for a in d["audit"]:
+            detail = str(a.get("detail") or "")
+            if key in detail:
+                a["detail"] = detail.replace(key, "[removed]")
 
         db_save(d)
 

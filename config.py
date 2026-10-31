@@ -179,6 +179,14 @@ def _bool_env(name, default=False):
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _float_env(name, default=0.0):
+    """Env se float — galat value par default (bot crash na ho)."""
+    try:
+        return float(str(os.getenv(name, "") or "").strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
 # ---------------------------------------------------------------------
 # #2c  STORAGE / DURABILITY  (storage.py padhta hai)
 # ---------------------------------------------------------------------
@@ -205,6 +213,13 @@ LINKS_KEEP = _int_env("LINKS_KEEP", 1000)
 # Admin action journal (audit log) kitni entries yaad rahen
 AUDIT_KEEP = _int_env("AUDIT_KEEP", 300)
 
+# ---- Durability ka sach (audit AV-003) -------------------------------
+# /ready sirf tab 200 deta hai jab data SACH ME restart ke baad bacha rahe.
+# Mongo connected = durable. Mongo down + ye False = EPHEMERAL (Render Free
+# ka disk) -> /ready 503 deta hai, kyunki redeploy par wo mit jayega.
+# Apne VPS / real disk par chalate ho to True karo.
+LOCAL_DISK_PERSISTENT = _bool_env("LOCAL_DISK_PERSISTENT", False)
+
 # ---------------------------------------------------------------------
 # #2d  UPDATE DELIVERY  (Telegram ke duplicate / concurrent updates)
 # ---------------------------------------------------------------------
@@ -218,6 +233,18 @@ WEBHOOK_CONCURRENCY = _int_env("WEBHOOK_CONCURRENCY", 8)
 # Restart par Telegram ke pending updates phenk du? Purana behaviour True tha,
 # jisse restart ke waqt ke messages chup-chaap kho jaate the (audit TG-02).
 DROP_PENDING_UPDATES = _bool_env("DROP_PENDING_UPDATES", False)
+
+# Ek update process fail hua to Telegram usse dobara bhejta hai. Kitni koshish
+# ke baad usse "dead letter" maan kar chhod dein (warna infinite loop banta hai).
+UPDATE_MAX_ATTEMPTS = _int_env("UPDATE_MAX_ATTEMPTS", 2)
+
+# ---- Duplicate tap / duplicate message protection --------------------
+# Ek hi button do baar dabane par do baar kaam na ho (jaise /post do baar
+# chala jaye). Itne second tak wahi callback dobara aaye to ignore.
+CB_COOLDOWN = _float_env("CB_COOLDOWN", 1.5)
+# Wahi message dobara aaye (user ne do baar send kar diya) to AI dobara na
+# chale — itne second tak same text skip hota hai. 0 = band.
+MSG_DEDUPE_WINDOW = _int_env("MSG_DEDUPE_WINDOW", 8)
 
 
 # Admin role RAKHA hai (code me hai) par koi assign nahi — sirf owner chalayega.
@@ -502,6 +529,19 @@ AI_USER_MAX = _int_env("AI_USER_MAX", 15)
 AI_DAILY_MAX = _int_env("AI_DAILY_MAX", 3000)
 # Ek group ka roz ka cap (sirf group ke replies ginte hain). 0 = cap nahi.
 AI_GROUP_DAILY_MAX = _int_env("AI_GROUP_DAILY_MAX", 400)
+
+# ---- AI reliability ("jawab kabhi aata nahi" ka fix) -----------------
+# Ek AI call par maximum kitni der intezaar karein. Iske baad agla model
+# try hota hai — pehle koi timeout hi nahi tha, to atki hui request par
+# user ko KABHI jawab nahi milta tha.
+AI_TIMEOUT = _int_env("AI_TIMEOUT", 45)
+# Ek saath kitni AI requests chal sakti hain (provider ko flood na karein).
+AI_CONCURRENCY = _int_env("AI_CONCURRENCY", 6)
+# "typing…" indicator kitni der me dobara bhejein (Telegram 5s me hata deta hai).
+AI_TYPING_EVERY = _int_env("AI_TYPING_EVERY", 4)
+# Rate limit / budget ki wajah se jawab na de paayein to user ko kitni der
+# me ek baar batayein (group me spam na ho). 0 = chup raho.
+AI_NOTICE_COOLDOWN = _int_env("AI_NOTICE_COOLDOWN", 120)
 
 # Latency: Gemini 3.8 Flash ka default "medium" thinking slow hai.
 # ZAROORI: Gemini 3.8 Flash sirf low | medium | high leta hai — "minimal"

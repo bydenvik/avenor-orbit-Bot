@@ -29,6 +29,7 @@ import difflib
 import json
 import hmac
 import logging
+from contextlib import asynccontextmanager
 from urllib.parse import quote
 import os
 import random
@@ -141,6 +142,13 @@ from config import (
     AI_USER_MAX,
     AI_DAILY_MAX,
     AI_GROUP_DAILY_MAX,
+    AI_TIMEOUT,
+    AI_CONCURRENCY,
+    AI_TYPING_EVERY,
+    AI_NOTICE_COOLDOWN,
+    CB_COOLDOWN,
+    MSG_DEDUPE_WINDOW,
+    UPDATE_MAX_ATTEMPTS,
     thinking_level_for,
     PRIVACY_TEXT,
     PRIVACY_URL,
@@ -213,6 +221,9 @@ from storage import (
     ai_usage,
     delete_user_data,
     purge_stale,
+    commit_now,
+    user_present,
+    doc_size_now,
     update_seen,
     mark_update_seen,
     health as storage_health,
@@ -455,6 +466,86 @@ def _ai_retryable(e) -> bool:
     return any(h in s for h in _AI_RETRYABLE)
 
 
+# AI ki asli haalat — /diag me dikhti hai. "Kabhi jawab nahi aata" jaisi
+# shikayat ka koi saboot hi nahi tha, isliye ab counters hain.
+_ai_stats = {"calls": 0, "ok": 0, "fail": 0, "timeout": 0, "budget": 0, "rate": 0}
+# Ek saath chalne wali AI requests (provider flood + memory se bachne ke liye).
+# Lazy banate hain: asyncio.Semaphore pehle await par event loop se bandh jata
+# hai, aur tests har case me naya loop banate hain — warna "bound to a different
+# event loop" aata.
+_ai_sem = None
+
+
+def _ai_limiter():
+    global _ai_sem
+    if _ai_sem is None:
+        _ai_sem = asyncio.Semaphore(max(1, AI_CONCURRENCY))
+    return _ai_sem
+
+
+async def _typing_loop(bot, chat_id, stop: asyncio.Event):
+    """"typing…" ko zinda rakho jab tak jawab na aaye.
+    Telegram ka typing indicator ~5 second me khud gayab ho jata hai, isliye
+    dheere jawab par user ko lagta tha ki bot ne suna hi nahi."""
+    while not stop.is_set():
+        try:
+            await bot.send_chat_action(chat_id, "typing")
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=max(1, AI_TYPING_EVERY))
+        except asyncio.TimeoutError:
+            pass
+
+
+@asynccontextmanager
+async def _typing(context, chat_id):
+    """async with _typing(context, chat_id): ... — iske andar typing chalti rehti hai."""
+    stop = asyncio.Event()
+    task = asyncio.create_task(_typing_loop(context.bot, chat_id, stop))
+    try:
+        yield
+    finally:
+        stop.set()
+        task.cancel()
+
+
+# Rate limit / budget ka notice kitni der me ek baar (group me spam na ho)
+_notice_at: dict = {}
+
+
+def _notice_allowed(key) -> bool:
+    if AI_NOTICE_COOLDOWN <= 0:
+        return False
+    now = time.time()
+    if now - _notice_at.get(key, 0) < AI_NOTICE_COOLDOWN:
+        return False
+    _notice_at[key] = now
+    _prune(_notice_at, 2000)
+    return True
+
+
+# Wahi message dobara aaye (double send / double tap) to AI dobara na chale.
+# Sirf aakhri text yaad rakhte hain — per (chat, user) ek entry, bounded.
+_last_text: dict = {}
+
+
+def _is_duplicate_text(chat_id, uid, text) -> bool:
+    """True = ye wahi message hai jo abhi-abhi aaya tha."""
+    if MSG_DEDUPE_WINDOW <= 0:
+        return False
+    key = (int(chat_id), int(uid))
+    now = time.time()
+    body = str(text or "").strip()[:500]
+    prev = _last_text.get(key)
+    _last_text[key] = (body, now)
+    _prune(_last_text, 5000)
+    if not prev or not body:
+        return False
+    prev_body, prev_ts = prev
+    return prev_body == body and (now - prev_ts) < MSG_DEDUPE_WINDOW
+
+
 def busy_message() -> str:
     """AI busy/down hone par user ko bhejne wala message."""
     ai_block = next((b for b in LINK_BLOCKS if b["name"].strip().lower() == "ai"), None)
@@ -482,10 +573,20 @@ async def ask_ai(prompt: str, lite: bool = False, where: str = "", mem_key=None,
     # Fail-fast: kam attempts, chhota backoff (delay kam karne ke liye).
     models = [AI_MODEL_LITE, AI_MODEL] if lite else [AI_MODEL, AI_MODEL_LITE]
     last_err = None
+    _ai_stats["calls"] += 1
     for model in models:
         for attempt in range(2):
             try:
-                text = await asyncio.to_thread(_run_ai, model, prompt, history)
+                # ZAROORI (user ki shikayat: "jawab kabhi aata nahi"):
+                # pehle is call par koi timeout hi nahi tha. Provider atak
+                # jaye to ye awaaz hi nahi karta tha — handler hamesha ke
+                # liye wait karta rehta aur user ko kuch nahi milta.
+                # Ab har koshish ka apna deadline hai, aur semaphore se ek
+                # saath chalne wali requests bhi bounded hain.
+                async with _ai_limiter():
+                    text = await asyncio.wait_for(
+                        asyncio.to_thread(_run_ai, model, prompt, history),
+                        timeout=max(1, AI_TIMEOUT))
                 if text:
                     text = _strip_md(text)      # markdown hatao (* aur ` )
                     if len(text) > AI_MAX_CHARS:
@@ -493,7 +594,17 @@ async def ask_ai(prompt: str, lite: bool = False, where: str = "", mem_key=None,
                     if mem_key is not None:
                         _hist_add(mem_key, "user", raw)
                         _hist_add(mem_key, "model", text)
+                    _ai_stats["ok"] += 1
                     return text
+                last_err = last_err or "empty response"
+                log.warning("AI ne khaali jawab diya (model=%s try=%s)", model, attempt + 1)
+            except asyncio.TimeoutError:
+                _ai_stats["timeout"] += 1
+                last_err = f"timeout after {AI_TIMEOUT}s"
+                log.warning("AI timeout (model=%s try=%s, %ss)", model, attempt + 1, AI_TIMEOUT)
+                # Timeout retry ke layak hai — par poora deadline dohraana
+                # bekaar, isliye seedha agla model.
+                break
             except Exception as e:
                 last_err = e
                 log.warning("AI fail (model=%s try=%s): %s", model, attempt + 1, e)
@@ -508,7 +619,8 @@ async def ask_ai(prompt: str, lite: bool = False, where: str = "", mem_key=None,
                     # Agle model par jao (ho sakta hai wo chal jaye).
                     break
                 # Exponential backoff + jitter (thundering herd se bachne ke liye).
-                await asyncio.sleep(min(0.5 * (2 ** attempt) + random.random() * 0.4, 4))
+                await asyncio.sleep(min(0.8 * (2 ** attempt) + random.random() * 0.4, 4))
+    _ai_stats["fail"] += 1
     log.error("AI poora fail: %s", last_err)
     # User ko kabhi provider ka naam nahi dikhna chahiye.
     return busy_message()
@@ -1669,17 +1781,31 @@ async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gate_ok = (not has_required_blocks()) or (bool(_ready) and not _no_id)
     _st = storage_health()
     _usage = ai_usage()
+    try:
+        _doc_kb = (await doc_size_now()) / 1024
+    except Exception:
+        _doc_kb = 0
     out = [bd("BOT STATUS"), "", sep,
            f"{sc('storage')} : {bd(mongo_status())}",
            f"{sc('state')}   : {bd(_st['state'])}",
-           f"{sc('durable')} : {bd('yes') if _st['durable'] else bd('NO')}",
+           f"{sc('durability')} : {bd(_st.get('durability') or '?')}",
+           f"{sc('ready')}  : {bd('200') if _st['durable'] else bd('503 (not durable)')}",
+           f"{sc('doc size')} : {bd(f'{_doc_kb:.0f} KB')} {sc('of 16384 KB')}",
            f"{sc('gate')}   : {bd('READY') if gate_ok else bd('NOT READY')}",
            f"{sc('checks')} : {len(_ready)}/{len(_ready) + len(_no_id)} {sc('channels')}",
            f"{sc('ai today')} : {bd(str(_usage.get('total', 0)))}/{AI_DAILY_MAX or '∞'}",
+           f"{sc('ai calls')} : {bd(str(_ai_stats['calls']))} "
+           f"({sc('ok')} {_ai_stats['ok']}, {sc('fail')} {_ai_stats['fail']}, "
+           f"{sc('timeout')} {_ai_stats['timeout']})",
+           f"{sc('ai skipped')} : {sc('rate')} {_ai_stats['rate']}, "
+           f"{sc('budget')} {_ai_stats['budget']}",
            sep, ""]
-    if not _st["durable"]:
-        out.append(f"{bd('WARNING')}: data kisi durable store par nahi hai — "
-                   "Mongo bhi nahi, local write bhi fail.")
+    if _st.get("durability") == "EPHEMERAL":
+        out.append(f"{bd('NOTE')}: Mongo down hai aur ye disk ephemeral hai — "
+                   "redeploy par data jayega. /ready 503 dega.")
+        out.append("")
+    elif not _st["durable"]:
+        out.append(f"{bd('WARNING')}: data kisi durable store par nahi hai.")
         out.append("")
     if not gate_ok:
         out.append(f"{sc('the gate cannot block anyone yet')}.")
@@ -1762,10 +1888,39 @@ async def _warn_admin_unverifiable(context, blocks):
     await _notify_owner(context.bot, text)
 
 
+# Webhook: ek update kitni baar fail hua (dead-letter ke liye).
+_update_fails: dict = {}
+
+
+# Ek hi button do baar dabaya (ya 10 baar) -> kaam EK baar.
+# Pehle /post par "Post now" do baar dabane se DO post jaate the, aur
+# "Delete my data" do baar dabane se delete do baar chalta tha.
+_cb_seen: dict = {}
+
+
+def _cb_duplicate(uid, data) -> bool:
+    """True = ye wahi tap abhi-abhi ho chuka hai, ignore karo."""
+    if CB_COOLDOWN <= 0:
+        return False
+    key = (int(uid), str(data))
+    now = time.time()
+    last = _cb_seen.get(key)
+    _cb_seen[key] = now
+    _prune(_cb_seen, 5000)
+    return last is not None and (now - last) < CB_COOLDOWN
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     user = update.effective_user
     data = q.data or ""
+
+    # Duplicate tap guard. q.answer() hamesha dena padta hai, warna Telegram
+    # client me spinner chalta rehta hai.
+    if _cb_duplicate(user.id, data):
+        log.info("Duplicate callback from %s (%s) — ignore.", user.id, data)
+        await q.answer("Already done")
+        return
 
     # Join-request ka Approve button (sirf owner/admin dabaa sakta hai)
     if data.startswith("gateai:"):
@@ -1798,6 +1953,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await q.answer("Deleting…")
         res = await _do_delete_user_data(user.id)
+        # Sach batao: delete hua ya nahi, aur kahan tak.
+        if res.get("verified"):
+            state_line = "Your record is gone from the database."
+        elif res.get("committed") == "disk":
+            state_line = ("Removed from the bot and saved to disk. The database "
+                          "is unreachable right now, so its copy will be purged "
+                          "as soon as it reconnects.")
+        else:
+            state_line = ("Removed from the bot, but the storage write failed. "
+                          "It is queued and will be written as soon as storage "
+                          "is reachable — please tell the owner if it does not "
+                          "settle within a day.")
         try:
             await q.edit_message_text(
                 "Deleted.\n\n"
@@ -1805,6 +1972,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Invite count   : {res['referrals']} removed\n"
                 f"Referral links : {res['referred_by']} cleaned\n"
                 f"Conversation   : {res['memory']} memory key(s) cleared\n\n"
+                f"{state_line}\n\n"
                 "You can keep using the bot; a new record starts only if you "
                 "send /start again.")
         except Exception:
@@ -1889,6 +2057,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 update.effective_chat.id,
                 "When should it go out? Format:\n2026-10-18 20:30   (or just 20:30 — IST)")
             return
+        # ZAROORI: flow PEHLE hata do, phir post bhejo. Warna do tap (ya
+        # slow network par double delivery) dono _send_post tak pahunch
+        # jaate the aur post do baar jaata tha.
+        _post_flow.pop(user.id, None)
         code = _new_code()
         data2 = dict(fl["data"])
         data2.update({"code": code, "type": fl["type"],
@@ -1897,7 +2069,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       "image": fl.get("image"), "posted": False, "created": _now()})
         db_post_save(code, data2)
         ok = await _send_post(context, code)
-        _post_flow.pop(user.id, None)
         await context.bot.send_message(
             update.effective_chat.id,
             ("Posted ✅\n" if ok else "Could not post (is the bot an admin in that channel?)\n")
@@ -2116,11 +2287,13 @@ async def on_guest_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     if _ai_budget_blocked(msg.chat_id):
+        _ai_stats["budget"] += 1
         return
     _ai_count(msg.chat_id)
-    answer = await ask_ai(prompt, where=where,
-                          mem_key=f"g{msg.chat_id}:u{user.id}" if user else None,
-                          note=_owner_note(user.id) if user else "")
+    async with _typing(context, msg.chat_id):
+        answer = await ask_ai(prompt, where=where,
+                              mem_key=f"g{msg.chat_id}:u{user.id}" if user else None,
+                              note=_owner_note(user.id) if user else "")
     answer = _strip_urls(answer) or answer
     # Jawab ke saath Avenor ke buttons — isi se naye log channel tak aate hain.
     rows = [[_btn(x["name"], url=x["url"], style="primary")] for x in LINK_BLOCKS[:3]]
@@ -2286,7 +2459,14 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if fch is not None and is_privileged(user.id):
         await _report_forwarded_chat(update.effective_message, fch)
         return
+    # Wahi message dobara (user ne do baar send kar diya / network ne duplicate
+    # kar diya) -> AI dobara na chale. Ek sawaal, ek jawab.
+    if _is_duplicate_text(update.effective_chat.id, user.id,
+                          update.effective_message.text):
+        log.info("Duplicate message from %s — AI skip (dedupe).", user.id)
+        return
     if not _ai_allowed(user.id):
+        _ai_stats["rate"] += 1
         await update.effective_message.reply_text(
             f"{fonts.small_caps('Slow down')} — {fonts.small_caps('too many messages, try again in a little while')}."
         )
@@ -2294,14 +2474,15 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Poore bot ka roz ka budget (per-user limit ke upar) — warna 200 log
     # milkar bill kabhi nahi rok paate.
     if _ai_budget_blocked():
+        _ai_stats["budget"] += 1
         await _safe(update.effective_message.reply_text, budget_message())
         return
     _ai_count()
-    await _safe(context.bot.send_chat_action, update.effective_chat.id, "typing")
-    await _safe(update.effective_message.reply_text,
-                await ask_ai(update.effective_message.text, where="a private chat",
-                             mem_key=f"u{user.id}",
-                             note=_owner_note(user.id)))
+    async with _typing(context, update.effective_chat.id):
+        answer = await ask_ai(update.effective_message.text, where="a private chat",
+                              mem_key=f"u{user.id}",
+                              note=_owner_note(user.id))
+    await _safe(update.effective_message.reply_text, answer)
 
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2331,20 +2512,35 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # Group/channel me gate NAHI — wahan seedha jawab do (gate sirf DM me).
     if not _ai_allowed(update.effective_user.id):
-        return   # group me chupchaap skip (group spam na ho)
+        # Pehle yahan CHUP-CHAAP return hota tha — user ko lagta tha bot ne
+        # suna hi nahi ("kabhi dekhta nahi" wali shikayat). Ab ek baar
+        # batate hain, phir cooldown tak chup.
+        _ai_stats["rate"] += 1
+        if _notice_allowed(("rate", msg.chat.id)):
+            await _safe(msg.reply_text,
+                        "Too many requests just now — please wait a moment and try again.")
+        return
     # Group ka apna roz ka budget — ek group poore bot ka quota na kha jaye.
     if _ai_budget_blocked(msg.chat.id):
+        _ai_stats["budget"] += 1
+        if _notice_allowed(("budget", msg.chat.id)):
+            await _safe(msg.reply_text, budget_message())
+        return
+    # Wahi message dobara mention hua -> dobara jawab na do.
+    if _is_duplicate_text(msg.chat.id, update.effective_user.id, msg.text):
+        log.info("Duplicate mention in %s — AI skip (dedupe).", msg.chat.id)
         return
     _ai_count(msg.chat.id)
     prompt = _strip_mention(msg.text, me.username) or "The user mentioned you. Greet them warmly."
     title = _clean_title(msg.chat.title)
     where = f'the Telegram group "{title}"' if title else "a Telegram group"
-    await _safe(context.bot.send_chat_action, update.effective_chat.id, "typing")
-    await _safe(msg.reply_text, await ask_ai(
-        prompt, where=where,
-        mem_key=f"g{msg.chat.id}:u{update.effective_user.id}",
-        note=_owner_note(update.effective_user.id),
-    ))
+    async with _typing(context, update.effective_chat.id):
+        answer = await ask_ai(
+            prompt, where=where,
+            mem_key=f"g{msg.chat.id}:u{update.effective_user.id}",
+            note=_owner_note(update.effective_user.id),
+        )
+    await _safe(msg.reply_text, answer)
 
 
 # =====================================================================
@@ -2523,8 +2719,10 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await context.bot.delete_message(r.chat_id, r.message_id)
+        # Message ka TEXT audit me nahi likhte — wo user ka content hai aur
+        # deletion ke baad bacha reh jata (audit AV-03). Sirf message id.
         audit_add(update.effective_user.id, "del", (r.from_user.id if r.from_user else None),
-                  r.chat_id, (r.text or r.caption or "[media]")[:80])
+                  r.chat_id, f"msg {r.message_id}")
         try:
             await msg.delete()
         except Exception:
@@ -2616,17 +2814,15 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     priv = chat.type == ChatType.PRIVATE
     if _ai_budget_blocked(None if priv else chat.id):
+        _ai_stats["budget"] += 1
         await update.effective_message.reply_text(budget_message())
         return
     _ai_count(None if priv else chat.id)
     mem = f"u{uid}" if priv else f"g{chat.id}:u{uid}"
-    try:
-        await context.bot.send_chat_action(chat.id, "typing")
-    except Exception:
-        pass
-    await update.effective_message.reply_text(
-        await ask_ai(q, where="a private chat" if priv else "a Telegram group",
-                     mem_key=mem, note=_owner_note(uid)))
+    async with _typing(context, chat.id):
+        answer = await ask_ai(q, where="a private chat" if priv else "a Telegram group",
+                              mem_key=mem, note=_owner_note(uid))
+    await update.effective_message.reply_text(answer)
 
 
 async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3375,7 +3571,16 @@ def _forget_memory(uid) -> int:
 
 
 async def _do_delete_user_data(uid) -> dict:
-    """Ek user ka data SAARE stores se hatao (DB + in-memory caches)."""
+    """Ek user ka data SAARE stores se hatao (DB + in-memory caches).
+
+    Audit AV-005: pehle deletion ke baad user ko turant "delete ho gaya" bol
+    diya jata tha, jabki Mongo me likhna 5 second baad hota tha. Us window me
+    crash hua to record wapas aa jata — matlab jhooth. Ab:
+      1. memory se delete,
+      2. TURANT durable commit (Mongo, warna local disk),
+      3. verify ki record sach me gaya,
+      4. tabhi user ko batate hain.
+    """
     res = delete_user_data(uid)          # storage.py: users/referrals/bans/...
     res["memory"] = _forget_memory(uid)
     _ai_hits.pop(uid, None)
@@ -3385,6 +3590,13 @@ async def _do_delete_user_data(uid) -> dict:
     _pending_post.pop(uid, None)
     _gate_msg.pop(uid, None)
     _check_cd.pop(uid, None)
+    # Is user ki har chat ki "last text" entry bhi hatao (DM aur group dono).
+    for _k in [k for k in list(_last_text.keys()) if k[1] == int(uid)]:
+        _last_text.pop(_k, None)
+
+    ok, where = await commit_now()
+    res["committed"] = where if ok else "failed"
+    res["verified"] = not user_present(uid)
     return res
 
 
@@ -3623,19 +3835,42 @@ def run_webhook(app: Application):
             log.info("Duplicate update %s — skip.", update.update_id)
             return Response(status_code=200)
 
+        failed = False
         async with _sem:
             async with _lock_for(_update_key(update)):
                 try:
                     await app.process_update(update)
                 except Exception:
-                    # 500 do to Telegram usi update ko hamesha dobara bhejta
-                    # rehta hai (loop). Handler-level errors pehle hi _safe()
-                    # aur on_error se log ho jaate hain — isliye 200.
+                    failed = True
                     log.exception("Update %s process fail", update.update_id)
-                else:
-                    # Sirf SAFAL hone par mark — fail hua to Telegram ka retry
-                    # dobara process hoga (at-least-once).
-                    mark_update_seen(update.update_id)
+
+        if not failed:
+            # Sirf SAFAL hone par mark — fail hua to Telegram ka retry
+            # dobara process hoga (at-least-once).
+            mark_update_seen(update.update_id)
+            _update_fails.pop(update.update_id, None)
+            return Response(status_code=200)
+
+        # Audit AV-006: pehle yahan hamesha 200 jaata tha, matlab ek exception
+        # wala update Telegram ke liye "successfully delivered" ban jata aur
+        # retry kabhi nahi hota — update chup-chaap kho jata.
+        # Ab pehli baar 500 -> Telegram dobara bhejega (idempotency upar hai).
+        n = _update_fails.get(update.update_id, 0) + 1
+        _update_fails[update.update_id] = n
+        _prune(_update_fails, 2000)
+        if n < max(1, UPDATE_MAX_ATTEMPTS):
+            log.warning("Update %s fail (%s/%s) — Telegram se retry mangwa raha hoon.",
+                        update.update_id, n, UPDATE_MAX_ATTEMPTS)
+            return Response(status_code=500)
+        # Baar-baar fail = permanently kharab update. Ab chhod do, warna
+        # Telegram hamesha retry karta rahega (infinite loop).
+        log.error("Update %s %s koshishon ke baad bhi fail — dead letter.",
+                  update.update_id, n)
+        mark_update_seen(update.update_id)
+        try:
+            audit_add(0, "update_failed", None, None, f"update {update.update_id}")
+        except Exception:
+            pass
         return Response(status_code=200)
 
     _START = time.time()
@@ -3657,11 +3892,22 @@ def run_webhook(app: Application):
 
     @api.get("/ready")
     async def ready():
-        """Strict check: 503 jab data kisi durable store par nahi hai.
-        Isko apne uptime monitor me lagao, /health ko nahi."""
+        """Strict check: 503 jab data kisi DURABLE store par nahi hai.
+        Isko apne uptime monitor me lagao, /health ko nahi.
+
+        Audit AV-003: pehle local file par likh dena hi "durable" maan liya
+        jata tha. Render Free ka disk ephemeral hai — wahan 200 dena jhoot
+        tha. Ab EPHEMERAL par 503, aur reason bhi saaf likha jata hai."""
         h = storage_health()
         ok = bool(h["durable"])
-        return JSONResponse({"ready": ok, "storage": h},
+        reason = {
+            "MONGO": "data is in MongoDB",
+            "PERSISTENT_DISK": "data is on a persistent local disk",
+            "EPHEMERAL": "only an ephemeral local file — lost on redeploy; "
+                         "set LOCAL_DISK_PERSISTENT=True only if the disk really persists",
+            "VOLATILE": "nothing is on disk — data lives only in memory",
+        }.get(h.get("durability"), "unknown")
+        return JSONResponse({"ready": ok, "reason": reason, "storage": h},
                             status_code=200 if ok else 503)
 
     # access_log=False -> webhook ka secret path logs me print nahi hota.

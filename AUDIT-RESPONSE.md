@@ -4,7 +4,46 @@ This document answers the production audit of 31 October 2026 line by line. Ever
 verdict: **Fixed**, **Partly fixed**, or **Open**, with the reason. Nothing is marked fixed unless the
 code was changed and a test covers it.
 
-Revision: `main` at `a76ce8e` + this change. Tests: 51, all passing (`python -m pytest`).
+Revision: `main` at `411f1f1` + this change. Tests: 77, all passing (`python -m pytest`).
+
+---
+
+## Second pass — the two follow-up audits, verified
+
+Two audits arrived after the first response: a Qwen audit (findings `AV-01`–`AV-03` plus `AV-02` on
+concurrency) and a second ChatGPT audit (`AV-001`–`AV-007`, commit `53b2955`). Each claim below was
+checked against the code before acting on it. Two were **not** accepted as described.
+
+### ChatGPT audit
+
+| ID | Claim | Verdict | What was done |
+|---|---|---|---|
+| AV-001 | `render.yaml` says `plan: free` while the changelog claims `starter` | **Correct — my regression** | The file the operator deployed was the old one; the claim was in my docs. `render.yaml` now says `free` honestly, with a comment on why Free is unsuitable, so manifest and docs agree |
+| AV-002 | Render installs `requirements.txt`, not `requirements.lock` | **Correct** | `buildCommand` is now `pip install -r requirements.lock` |
+| AV-003 | `/ready` can call ephemeral local storage durable | **Correct — real design flaw** | Durability now has four levels (`MONGO`, `PERSISTENT_DISK`, `EPHEMERAL`, `VOLATILE`); `/ready` returns 503 for the last two and states the reason. New setting `LOCAL_DISK_PERSISTENT` |
+| AV-004 | Update dedupe is lost across a restart | **Correct** | The processed-`update_id` ring is saved inside the state document (last 500, string keys for BSON) and restored on connect |
+| AV-005 | Deletion is acknowledged before it is durable | **Correct** | Deletion now commits (`commit_now`), verifies the record is gone, and only then reports — with an honest line if the write had to wait |
+| AV-006 | Webhook returns 200 after a processing exception | **Correct — and it was my deliberate trade** | Now 500 so Telegram redelivers, with a per-update attempt counter and a dead letter after `UPDATE_MAX_ATTEMPTS`, so a permanently bad update cannot loop forever |
+| AV-007 | Docs link to `docs/…` paths that do not exist | **Correct** | The files are at the repository root; every link now points there |
+
+### Qwen audit
+
+| ID | Claim | Verdict | What was done |
+|---|---|---|---|
+| AV-02 (Critical) | `threading.Lock` + `os.fsync` block the event loop | **Correct, but narrower than stated** | It only happens in `DEGRADED` (in `READY` a save just sets a flag), yet there it is real and it stalls every chat. JSON writes now run on one background writer thread; the Mongo flush's deepcopy and BSON sizing moved to `asyncio.to_thread`; the mirror write too |
+| AV-01 | Single document will hit 16 MiB at ~100k users | **Correct — already recorded as open** | Not split here (needs a migration and a staging database). Mitigations unchanged, plus the document size is now shown in `/diag` against the limit |
+| AV-03 | `delete_user_data` leaks PII in audit `detail` | **Partly correct** | The actor/target filter was already exhaustive, so no *entry* survived. The real residue was message text in `/del` details. `/del` now records the message id, not the content, and deletion scrubs the id from any surviving `detail` |
+
+### Two user-reported symptoms
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| "Tapping a button twice calls it twice — I want one output" | No idempotency on callbacks; `/post` cleared its flow *after* publishing, so two taps published twice | Per-user, per-button cooldown (`CB_COOLDOWN`); the post flow is cleared before sending. Same text from the same person is answered once (`MSG_DEDUPE_WINDOW`) |
+| "The reply sometimes never comes, sometimes fails, sometimes I see nothing" | Three separate causes: **no timeout** on the provider call (a hung request waited forever), rate-limit and budget refusals returned **silently** in groups, and the typing indicator died after ~5 s so it looked ignored | `AI_TIMEOUT` per attempt, `AI_CONCURRENCY` cap, a live typing indicator, and a throttled notice instead of silence. `/diag` now shows AI call/ok/fail/timeout counters |
+
+A bug found by the new tests while doing this: `flush_local_now()` and the writer thread shared
+`db.json.tmp`, so a deletion commit racing a background write could fail with `FileNotFoundError`.
+Writes are now serialised with a dedicated lock.
 
 ---
 

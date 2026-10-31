@@ -1,5 +1,70 @@
 # Changelog
 
+## 2026-10-31 — second pass (two external audits + two user reports)
+
+Response to the Qwen audit (`AV-02`) and the second ChatGPT audit (`AV-001`–`AV-007`), plus two
+reported symptoms: a button tapped twice doing the work twice, and AI replies sometimes never
+arriving. Full verdicts in [AUDIT-RESPONSE.md](AUDIT-RESPONSE.md).
+
+### Fixed
+
+- **Event loop blocked by disk writes (Qwen AV-02).** In degraded mode every save ran `fsync` on the
+  event loop thread while holding the state lock, so one slow write stalled every other chat, the
+  health endpoint and webhook delivery. JSON writes now go through a single background writer thread
+  (latest snapshot only), and the Mongo flush's deepcopy + BSON sizing moved off the loop too.
+- **Readiness overstated durability (AV-003).** A successful local write was treated as durable.
+  Durability now has four explicit levels — `MONGO`, `PERSISTENT_DISK`, `EPHEMERAL`, `VOLATILE` — and
+  `/ready` returns 503 unless data survives a restart. New setting: `LOCAL_DISK_PERSISTENT`.
+- **Deletion acknowledged before it was durable (AV-005).** `/delete_my_data` now commits, verifies the
+  record is gone, and only then reports success — and says plainly if the write had to wait.
+- **Webhook acknowledged failures as success (AV-006).** A processing exception returned HTTP 200, so
+  Telegram never retried and the update was silently lost. It now returns 500 so Telegram redelivers,
+  and after `UPDATE_MAX_ATTEMPTS` records a dead letter instead of looping forever.
+- **Retry dedupe lost on restart (AV-004).** The processed-`update_id` ring is now saved with the state
+  document and restored on connect.
+- **Duplicate taps (user report).** Tapping the same button twice — or ten times — ran the handler
+  twice; "Post now" published two posts. Callbacks now have a per-user, per-button cooldown
+  (`CB_COOLDOWN`), and the `/post` flow is cleared *before* publishing.
+- **Duplicate messages.** Sending the same text twice produced two AI answers. The same text from the
+  same person in the same chat within `MSG_DEDUPE_WINDOW` is answered once.
+- **AI replies that never arrived (user report).** There was no timeout on the provider call, so a
+  hung request left the user waiting forever. Every attempt now has a deadline (`AI_TIMEOUT`),
+  concurrency is bounded (`AI_CONCURRENCY`), the "typing…" indicator is kept alive for the whole wait,
+  and rate-limit or budget refusals are now announced once per cooldown instead of silently ignored.
+- **Render manifest contradicted the docs (AV-001, AV-002).** `render.yaml` now installs
+  `requirements.lock` and states `plan: free` honestly, with the reason Free is unsuitable.
+- **Audit journal kept message text (Qwen AV-03).** `/del` records the message id, not its content, and
+  deletion scrubs the user's id from any remaining journal entry.
+
+### Added
+
+- `/diag` now shows durability, the real `/ready` status, document size against the 16 MiB limit, and
+  AI counters (calls, ok, fail, timeout, rate-limited, budget-blocked) — the "no reply" complaint had
+  no evidence to inspect before this.
+- Tests: 77 (up from 51), covering every fix above — including a test that a hung AI call still
+  answers the user.
+- Settings: `LOCAL_DISK_PERSISTENT`, `AI_TIMEOUT`, `AI_CONCURRENCY`, `AI_TYPING_EVERY`,
+  `AI_NOTICE_COOLDOWN`, `CB_COOLDOWN`, `MSG_DEDUPE_WINDOW`, `UPDATE_MAX_ATTEMPTS`.
+
+### Found while fixing
+
+- A real bug the new tests caught: `flush_local_now()` and the writer thread both used `db.json.tmp`,
+  so a deletion commit racing a background write could fail with `FileNotFoundError`. Writes are now
+  serialised with a dedicated lock.
+
+### Also in this revision (from the previous pass, unchanged here)
+
+- Badge line (`UPDATE LIVE`) is centred using padding — Telegram has no text alignment — tunable with
+  `POST_BADGE_CENTER` / `POST_BADGE_WIDTH`.
+- The assistant is told what the bot can actually do, generated from its own command table.
+
+### Still open
+
+- Single-document MongoDB state (DB-02 / AV-01) — bounded and measured, not split.
+- Handler layer still in `bot.py`.
+- No mocked-`Update` integration tests for the Telegram handlers themselves.
+- Bot API 10.1–10.3 — waiting on `python-telegram-bot`.
+
 ## 2026-10-31 — reliability and privacy pass
 
 Response to the production audit of the same date. Full mapping in

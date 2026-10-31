@@ -10,7 +10,7 @@ can read it at 2 a.m.
 | Signal | Where | Meaning |
 |---|---|---|
 | `GET /health` | always 200 | `status` is `ok` or `degraded`; carries storage state, durability, retry countdown, last error, uptime, today's AI usage |
-| `GET /ready` | 200 / 503 | 503 means data is **not** on a durable store. Point your uptime monitor at this one |
+| `GET /ready` | 200 / 503 | 503 means data is **not** on a durable store. Point your uptime monitor at this one. The body says which level: `MONGO`, `PERSISTENT_DISK`, `EPHEMERAL` or `VOLATILE` |
 | `/diag` | Telegram, owner | Storage state, durability, gate readiness, per-channel permissions, today's AI usage |
 | `/mongo` | Telegram, owner | Live connection test with the real error mapped to plain language; never prints the password |
 | `/audit` | Telegram, owner | The last 25 privileged actions: actor, action, target, chat |
@@ -25,7 +25,10 @@ Use `/ready` for alerting.
 
 The bot does not stop. It goes `DEGRADED`:
 
-- every write goes to `data/db.json` with `fsync`, so nothing acknowledged is lost to a crash;
+- every write goes to `data/db.json` with `fsync` — on a background writer thread, so a slow disk
+  never stalls the bot (Qwen AV-02);
+- `/ready` returns 503, because an ephemeral disk is not durable (AV-003) — unless you set
+  `LOCAL_DISK_PERSISTENT=True` on a host with a real disk;
 - reconnection attempts run with bounded exponential backoff plus jitter (1 s → 60 s cap);
 - the owner is messaged with the plain-language cause;
 - `/health` reports `degraded` and `/ready` returns 503.
@@ -68,7 +71,7 @@ print("doc bytes:", Object.bsonsize(s));
 ```
 
 `doc bytes` above 12 MiB means the owner has already been warned; above 16 MiB writes will be pruned.
-See `docs/AUDIT-RESPONSE.md` (DB-02) for the real fix.
+See `AUDIT-RESPONSE.md` (DB-02) for the real fix.
 
 ---
 
@@ -100,7 +103,14 @@ Three limits, all in `config.py`:
 | `AI_GROUP_DAILY_MAX` | 400 | one group cannot consume the whole budget |
 | `AI_DAILY_MAX` | 3000 | bot-wide cap per UTC day |
 
-Usage is in `/diag` and in `/health` (`ai_today`). When the daily cap is hit, users get a polite
+Every provider call has a deadline (`AI_TIMEOUT`, default 45 s); after that the fallback model is
+tried, and if both fail the user still gets a reply instead of silence. The "typing…" indicator is
+refreshed for the whole wait, and a rate-limit or budget refusal is announced once per
+`AI_NOTICE_COOLDOWN` rather than swallowed.
+
+Usage is in `/diag` and in `/health` (`ai_today`). `/diag` also shows AI counters — calls, ok, fail,
+timeout, rate-limited, budget-blocked — which is the first place to look when someone says "the bot
+did not answer". When the daily cap is hit, users get a polite
 message with the direct-AI link instead of a failure. Internal AI calls (post episode lines, the
 deep-link welcome line) are not counted, so publishing never stops because of the budget.
 

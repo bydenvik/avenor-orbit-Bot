@@ -105,8 +105,9 @@ Three short fields cannot break that way, and the bot assembles and percent-enco
 `MONGO_URI` is still accepted if you prefer one string.
 
 Optional: `MONGO_DB` (default `avenor_orbit`), `ADMIN_IDS`, `ADMIN_NAMES`, `BOT_BRAND`, `GUEST_MODE`,
-`AUTO_APPROVE_JOIN`, `NOTIFY_OWNER`, `AI_THINKING_LEVEL`, `AI_DAILY_MAX`, `PRIVACY_URL`,
-`CACHE_RETENTION_DAYS`, `DROP_PENDING_UPDATES`. The full list with defaults is in `env.example.txt`.
+`AUTO_APPROVE_JOIN`, `NOTIFY_OWNER`, `AI_THINKING_LEVEL`, `AI_TIMEOUT`, `AI_DAILY_MAX`,
+`AI_GROUP_DAILY_MAX`, `PRIVACY_URL`, `CACHE_RETENTION_DAYS`, `DROP_PENDING_UPDATES`,
+`LOCAL_DISK_PERSISTENT`, `POST_BADGE_WIDTH`. The full list with defaults is in `env.example.txt`.
 
 ---
 
@@ -153,7 +154,7 @@ Storage is a small state machine, not a boolean. `storage.py` reports one of:
 |---|---|
 | `CONNECTING` | First connection attempt is running |
 | `READY` | MongoDB connected; writes are write-behind (flushed every 5 s) |
-| `DEGRADED` | MongoDB is down; every write goes to the local JSON file **with `fsync`** |
+| `DEGRADED` | MongoDB is down; every write goes to the local JSON file **with `fsync`**, on a background writer thread so a slow disk never stalls the bot |
 | `RECONNECTING` | Backoff elapsed, trying again |
 | `DISABLED` | No MongoDB configured |
 
@@ -218,7 +219,7 @@ if it fails, without ever printing the password.
 | Path | Purpose |
 |---|---|
 | `GET /health` | Always 200. `status` is `ok` or `degraded`; includes storage state and uptime. |
-| `GET /ready` | 200 when data is on a durable store, 503 when degraded. Point your uptime monitor here. |
+| `GET /ready` | 200 when data survives a restart, 503 when it does not. Point your uptime monitor here; the body names the level (`MONGO`, `PERSISTENT_DISK`, `EPHEMERAL`, `VOLATILE`). |
 | `POST /tg/<secret>` | The Telegram webhook. Rejects a bad `X-Telegram-Bot-Api-Secret-Token` with 403. |
 
 ---
@@ -234,7 +235,21 @@ exactly this reason. The webhook handler therefore:
   state behind the gate, referrals and `/post` cannot interleave; different chats still run
   concurrently, up to `WEBHOOK_CONCURRENCY`;
 - **preserves pending updates** — `drop_pending_updates` is now `False` by default, so a restart no
-  longer throws away messages and join requests that arrived during the restart.
+  longer throws away messages and join requests that arrived during the restart;
+- **retries a real failure** — an exception returns 500 so Telegram redelivers, and after
+  `UPDATE_MAX_ATTEMPTS` the update is recorded as a dead letter instead of looping forever;
+- **keeps the dedupe ring across restarts**, so a retry after a crash does not repeat a side effect.
+
+Duplicate input is also handled below the webhook: a button tapped twice runs its handler once
+(`CB_COOLDOWN`), and the same message sent twice is answered once (`MSG_DEDUPE_WINDOW`).
+
+## AI replies
+
+Every provider call has a deadline (`AI_TIMEOUT`, default 45 s). On timeout or a retryable error the
+fallback model is tried; if both fail the user still gets a message instead of silence. Concurrency is
+capped (`AI_CONCURRENCY`), the "typing…" indicator stays alive for the whole wait, and a rate-limit or
+budget refusal is announced once per `AI_NOTICE_COOLDOWN` rather than swallowed. `/diag` shows the
+counters: calls, ok, fail, timeout, rate-limited, budget-blocked.
 
 ---
 
@@ -277,6 +292,9 @@ Privacy Policy, and set `PRIVACY_URL` so `/privacy` links to it.
   [AUDIT-RESPONSE.md](AUDIT-RESPONSE.md), finding DB-02.
 - On Render's free tier the service sleeps after about 15 minutes idle, so the first request after a
   pause takes 30–50 seconds. A scheduled post may fire late for the same reason.
+- The assistant is told what the bot can do, generated from its own command table, so "what can you
+  do" answers are accurate and it cannot invent features. Turn it off with
+  `AI_CAPABILITIES_IN_PROMPT=False` (it costs roughly 1.5k tokens per request).
 - `python-telegram-bot` 22.8 targets Bot API 10.0. Rich messages and the 10.1–10.3 features are not
   available until PTB ships them.
 
