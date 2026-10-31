@@ -1,0 +1,39 @@
+# =====================================================================
+#  requirements.lock  —  resolved, exact versions  (audit OPS-02)
+# =====================================================================
+#  requirements.txt RANGES deta hai (>=x,<y) — usse do builds alag versions
+#  resolve kar sakte hain, aur "kal chal raha tha, aaj crash" wali classic
+#  problem banti hai. Ye file wahi set pin karti hai jo sach me resolve hua.
+#
+#  Kahan se aayi: 31 Oct 2026, Python 3.12.13, linux/amd64,
+#                 `pip install -r requirements.txt` ke baad
+#                 `python -m pip freeze` se.
+#
+#  KAB use karein: production deploy (Render) me, taaki har deploy par
+#  bilkul wahi versions chalein:
+#       pip install -r requirements.lock
+#
+#  KAB update karein: jaan-boojh kar upgrade karna ho. Us waqt:
+#       1. requirements.txt me range update karo
+#       2. fresh venv me `pip install -r requirements.txt`
+#       3. `pip freeze > requirements.lock`
+#       4. tests chalao (`pytest`), phir commit karo
+#
+#  Ye file haath se edit mat karo — generate karo.
+# =====================================================================
+
+python-telegram-bot==22.8
+aiolimiter==1.3.0
+google-genai==2.34.0
+pymongo==4.19.0
+fastapi==0.162.0
+uvicorn==0.54.0
+python-dotenv==1.2.4
+
+# ---- transitive (inhe bhi pin karna zaroori hai) ----
+anyio==4.15.1
+certifi==2026.7.22
+httpx==0.28.1
+pydantic==2.14.2
+starlette==1.7.0
+typing-extensions==4.16.0
