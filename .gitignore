@@ -3,7 +3,6 @@
 #  Ye file ka naam .gitignore hi hona chahiye (bindu se shuru).
 #  "gitignore.txt" naam se GitHub ise IGNORE kar deta hai — matlab neeche
 #  ke saare rules lagu hi nahi hote, aur .env / data/ commit ho sakte hain.
-#  (Pehle repo me gitignore.txt pada tha — wo delete kar dena.)
 # =====================================================================
 
 # ---- Secrets — NEVER commit ----
