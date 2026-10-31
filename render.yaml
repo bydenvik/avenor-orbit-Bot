@@ -4,17 +4,35 @@
 #  Ye file sirf "New + -> Blueprint" deploy ke saath chalti hai. Normal
 #  "Web Service" me Render ise ignore karta hai — tab Build/Start command aur
 #  environment variables Dashboard me khud set karo:
-#     Build Command: pip install -r requirements.txt
+#     Build Command: pip install -r requirements.lock
 #     Start Command: python bot.py
+#     Health Check Path: /health
+# =====================================================================
+#
+#  PLAN: free — yahan jaan-boojh kar free hai, kyunki service free par chalti
+#  hai. Ye PRODUCTION ke liye theek NAHI hai (audit OPS-01):
+#    • disk ephemeral hai — restart/redeploy par data/ ud jata hai
+#    • 15 min traffic na aane par service sleep ho jati hai
+#    • sleep ke baad pehla request 30-50s leta hai (scheduled post late)
+#  Isliye MongoDB Atlas (durable) ZAROORI hai. Jab paid plan par jaao to
+#  plan: starter kar dena — tab /ready 200 dene lagega jab Mongo connected ho.
+#  (Pehle yahan aur docs me "starter" likha tha jabki service free par thi —
+#   audit AV-001 ne yahi contradiction pakda tha. Ab dono jagah sach hai.)
 # =====================================================================
 services:
   - type: web
     name: avenor-orbit
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    # LOCKFILE se install — pinned versions (audit AV-002). requirements.txt
+    # sirf ranges deta hai; production me wahi chale jo test hua hai.
+    buildCommand: pip install -r requirements.lock
     startCommand: python bot.py
+    # Render isi path ko poll karta hai. Ye HAMESHA 200 deta hai (degraded me
+    # bhi) — warna Render service ko restart karta rehta hai. Strict check ke
+    # liye /ready use karo (durable na ho to 503).
     healthCheckPath: /health
+    autoDeploy: true
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.13"
@@ -50,11 +68,28 @@ services:
         value: "True"
       - key: NOTIFY_OWNER
         value: "False"
+      # Restart par Telegram ke pending updates phenk du? False = rakho.
+      - key: DROP_PENDING_UPDATES
+        value: "False"
+      # Render ka disk ephemeral hai -> False. /ready isi ki buniyad par
+      # 503/200 deta hai. VPS par chalate ho to True.
+      - key: LOCAL_DISK_PERSISTENT
+        value: "False"
 
-      # ---- Optional (defaults config.py me hain) ----
-      # - key: BOT_USERNAME
-      # - key: ADMIN_NAMES
-      # - key: AI_MODEL
-      #   value: gemini-3.8-flash
-      # - key: AI_MODEL_LITE
-      #   value: gemini-3.5-flash-lite
+      # ---- AI (3.8 Flash "minimal" nahi leta) ----
+      - key: AI_THINKING_LEVEL
+        value: "low"
+      - key: AI_DAILY_MAX
+        value: "3000"
+      - key: AI_GROUP_DAILY_MAX
+        value: "400"
+      # Ek AI call ka deadline (seconds) — iske baad fallback model.
+      - key: AI_TIMEOUT
+        value: "45"
+
+      # ---- Privacy ----
+      # BotFather > Bot Settings > Privacy Policy me yahi URL daalo.
+      # - key: PRIVACY_URL
+      #   value: https://raw.githubusercontent.com/<user>/<repo>/main/PRIVACY.md
+      - key: CACHE_RETENTION_DAYS
+        value: "30"
