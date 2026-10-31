@@ -1,18 +1,15 @@
 # =====================================================================
-#  render.yaml  —  RENDER BLUEPRINT (OPTIONAL)
+#  render.yaml  —  RENDER BLUEPRINT (OPTIONAL)  ·  Avenor Orbit
 # =====================================================================
-#  This file only works with Render's "New + -> Blueprint" deploy.
-#  With a normal "Web Service" deploy Render ignores it — then set the
-#  Build/Start commands and the environment variables yourself in the
-#  Dashboard (see README).
+#  Ye file sirf "New + -> Blueprint" deploy ke saath chalti hai. Normal
+#  "Web Service" me Render ise ignore karta hai — tab Build/Start command aur
+#  environment variables Dashboard me khud set karo:
 #     Build Command: pip install -r requirements.txt
 #     Start Command: python bot.py
-#
-#  Render schema: https://render.com/schema/render.yaml.json
 # =====================================================================
 services:
   - type: web
-    name: ongoing-bot
+    name: avenor-orbit
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -21,37 +18,43 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.13"
-      # ---- Required ----
-      # sync: false  ->  value is entered in the Render Dashboard (secret)
+
+      # ---- Required (Dashboard me daalo — sync: false) ----
       - key: BOT_TOKEN
         sync: false
-      - key: OWNER_ID            # MISSING THA — isi se owner ko power milti hai
-        sync: false
-      - key: AI_API_KEY
+      - key: OWNER_ID
         sync: false
       - key: ADMIN_IDS
         sync: false
-      - key: ADMIN_NAMES
+      - key: AI_API_KEY
         sync: false
-      # ---- Storage (so posts/links survive a redeploy) ----
-      # Atlas ka poora connection string. Atlas > Network Access me
-      # 0.0.0.0/0 add karna ZAROORI hai (Render ka outbound IP badalta hai).
-      - key: MONGO_URI
+
+      # ---- Storage: 3 chhote fields (MONGO_URI se behtar) ----
+      # Atlas > Database > Connect > Drivers > Python se sirf HOST copy karo:
+      #   cluster0.abc123.mongodb.net
+      - key: MONGO_HOST
+        sync: false
+      - key: MONGO_USER
+        sync: false
+      - key: MONGO_PASSWORD
         sync: false
       - key: MONGO_DB
-        value: "ongoing_bot"
-      # ---- Optional (defaults already set in config.py) ----
+        value: "avenor_orbit"
+
+      # ---- Behaviour ----
       - key: BOT_BRAND
-        value: "Ongoing"
-      - key: BOT_USERNAME
-        sync: false
+        value: "Avenor Orbit"
+      - key: GUEST_MODE          # BotFather > Bot Settings > Guest Mode ON
+        value: "True"
+      - key: AUTO_APPROVE_JOIN   # join request turant approve, koi button nahi
+        value: "True"
       - key: NOTIFY_OWNER
         value: "False"
+
+      # ---- Optional (defaults config.py me hain) ----
+      # - key: BOT_USERNAME
+      # - key: ADMIN_NAMES
       # - key: AI_MODEL
       #   value: gemini-3.8-flash
       # - key: AI_MODEL_LITE
       #   value: gemini-3.5-flash-lite
-      - key: JOIN_FAIL_MODE
-        value: "closed"
-      - key: MIN_JOINS_REQUIRED
-        value: "all"
