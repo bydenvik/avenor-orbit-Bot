@@ -147,8 +147,8 @@ MONGO_PLACEHOLDER = ("xxx" in _MONGO_HOST.lower()) or ("<" in MONGO_URI_SAFE) or
 #        gemini-3.5-flash-lite  <- latest Flash-Lite (Jul 2026)  = fallback
 #        gemini-3.5-flash       <- PURANA: auto-route ho raha hai
 #                                  gemini-3.6-flash par. Isliye hata diya.
-#      Defaults:
-#        AI_MODEL      = gemini-3.5-flash
+#      Defaults (code me jo sach me lagta hai):
+#        AI_MODEL      = gemini-3.8-flash
 #        AI_MODEL_LITE = gemini-3.5-flash-lite
 AI_MODEL = os.getenv("AI_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-3.8-flash"
 AI_MODEL_LITE = (
@@ -169,6 +169,55 @@ def _int_env(name, default=0):
         return int(str(os.getenv(name, "") or "").strip() or default)
     except (TypeError, ValueError):
         return default
+
+
+def _bool_env(name, default=False):
+    """Env se bool — 'True'/'1'/'yes'/'on' sab chalein, baaki False."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------
+# #2c  STORAGE / DURABILITY  (storage.py padhta hai)
+# ---------------------------------------------------------------------
+# Purana design: Mongo fail hua to bot chup-chaap RAM + local JSON par chalta
+# rehta tha aur dobara connect karne ki koshish HI nahi karta tha (audit DB-01).
+# Ab storage.py ek state machine chalata hai:
+#   CONNECTING -> READY -> DEGRADED -> RECONNECTING -> READY ...
+# Ye values us machine ki tuning hain.
+
+# Dirty state kitni der me Mongo me likhi jaye (seconds)
+STORAGE_FLUSH_EVERY = _int_env("STORAGE_FLUSH_EVERY", 5)
+# Mongo connected ho tab bhi local JSON ki safety copy kitni der me
+STORAGE_MIRROR_EVERY = _int_env("STORAGE_MIRROR_EVERY", 600)
+# Chup-chaap mari hui connection pakadne ke liye health check ka interval
+STORAGE_HEALTH_EVERY = _int_env("STORAGE_HEALTH_EVERY", 60)
+# Reconnect backoff ka ceiling (seconds). 1,2,4,8,... yahan ruk jata hai.
+STORAGE_MAX_BACKOFF = _int_env("STORAGE_MAX_BACKOFF", 60)
+# MongoDB ka hard limit 16 MiB hai — usse pehle warning, uske baad prune.
+STORAGE_DOC_LIMIT_BYTES = _int_env("STORAGE_DOC_LIMIT_BYTES", 16 * 1024 * 1024)
+STORAGE_ALERT_BYTES = _int_env("STORAGE_ALERT_BYTES", 12 * 1024 * 1024)
+# Kitne posts / links rakhe jayen (purane gira diye jaate hain — doc bound)
+POSTS_KEEP = _int_env("POSTS_KEEP", 200)
+LINKS_KEEP = _int_env("LINKS_KEEP", 1000)
+# Admin action journal (audit log) kitni entries yaad rahen
+AUDIT_KEEP = _int_env("AUDIT_KEEP", 300)
+
+# ---------------------------------------------------------------------
+# #2d  UPDATE DELIVERY  (Telegram ke duplicate / concurrent updates)
+# ---------------------------------------------------------------------
+# Telegram webhook fail hone par wahi update DOBARA bhejta hai. Ek hi
+# update_id par dobara referral/ban na lage — isliye dedupe.
+UPDATE_DEDUPE_TTL = _int_env("UPDATE_DEDUPE_TTL", 900)
+UPDATE_DEDUPE_SIZE = _int_env("UPDATE_DEDUPE_SIZE", 2000)
+# Alag-alag chats ke updates EK SAATH chal sakte hain; ek hi chat ke nahi
+# (state race se bachne ke liye). Ye concurrency ki hadd hai.
+WEBHOOK_CONCURRENCY = _int_env("WEBHOOK_CONCURRENCY", 8)
+# Restart par Telegram ke pending updates phenk du? Purana behaviour True tha,
+# jisse restart ke waqt ke messages chup-chaap kho jaate the (audit TG-02).
+DROP_PENDING_UPDATES = _bool_env("DROP_PENDING_UPDATES", False)
 
 
 # Admin role RAKHA hai (code me hai) par koi assign nahi — sirf owner chalayega.
@@ -326,9 +375,10 @@ WELCOME_IMAGE = os.getenv(
     "welcome.png" if os.path.exists("welcome.png") else "assets/welcome.png",
 )
 
-# NOTE: Join requests AUTO-approve NAHI hote. Har request OWNER ko DM jaati hai
-# (details + Approve button ke saath), aur owner approve kare tabhi banda
-# us channel/group me join karta hai.
+# NOTE: Join requests ka behaviour AUTO_APPROVE_JOIN se chalta hai (neeche #5).
+#   True  (default) -> request aate hi turant approve, koi button nahi.
+#   False           -> sirf record hoti hai, approve owner khud karega.
+# (Purana comment ulta keh raha tha — code auto-approve karta hai.)
 
 
 # ---------------------------------------------------------------------
@@ -437,9 +487,48 @@ AI_PROMPT_FROM_ENV = bool((os.getenv("AI_SYSTEM_PROMPT") or "").strip())
 # AI reply ki max length per message (Telegram limit ~4096)
 AI_MAX_CHARS = _int_env("AI_MAX_CHARS", 3800)
 
-# Latency: Gemini 3 Flash default "medium" thinking par chalta hai — slow.
-# "minimal" = sabse fast. Values: minimal | low | medium | high | "" (off)
-AI_THINKING_LEVEL = os.getenv("AI_THINKING_LEVEL", "minimal")
+# ---- AI ka kharcha (cost control) -----------------------------------
+# Per-user window: ek user itne second me itni hi requests kar sakta hai
+AI_USER_WINDOW = _int_env("AI_USER_WINDOW", 60)
+AI_USER_MAX = _int_env("AI_USER_MAX", 15)
+# Poore bot ka roz ka cap (UTC din). 0 = cap nahi.
+AI_DAILY_MAX = _int_env("AI_DAILY_MAX", 3000)
+# Ek group ka roz ka cap (sirf group ke replies ginte hain). 0 = cap nahi.
+AI_GROUP_DAILY_MAX = _int_env("AI_GROUP_DAILY_MAX", 400)
+
+# Latency: Gemini 3.8 Flash ka default "medium" thinking slow hai.
+# ZAROORI: Gemini 3.8 Flash sirf low | medium | high leta hai — "minimal"
+# bhejne par pehli request VALIDATION ERROR deti hai (audit AI-01).
+# Isliye default "low" hai. Khaali string = thinking config bhejo hi nahi.
+AI_THINKING_LEVEL = (os.getenv("AI_THINKING_LEVEL", "low") or "").strip().lower()
+
+# Har model ke supported thinking levels. Model yahan na mile to level
+# jaise-ka-taisa bhej diya jata hai (naya model ho sakta hai).
+AI_THINKING_LEVELS_BY_MODEL = {
+    "gemini-3.8-flash": ("low", "medium", "high"),
+    "gemini-3.6-flash": ("minimal", "low", "medium", "high"),
+    "gemini-3.5-flash": ("minimal", "low", "medium", "high"),
+    "gemini-3.5-flash-lite": ("minimal", "low", "medium", "high"),
+}
+
+
+def thinking_level_for(model: str) -> str:
+    """Us model ke liye VALID thinking level. "" = config hi na bhejo.
+
+    Pehle bot har model par wahi level bhej deta tha aur galat level par
+    pehli request fail hoti thi, phir retry me config band hota tha. Ab
+    galat level pehle hi theek ho jata hai (sabse kareebi valid level par),
+    isliye ek bhi request bekaar nahi jaati."""
+    level = (AI_THINKING_LEVEL or "").strip().lower()
+    if not level:
+        return ""
+    allowed = AI_THINKING_LEVELS_BY_MODEL.get(str(model or "").strip().lower())
+    if allowed is None:
+        return level                      # anjaan model — user ki baat maano
+    if level in allowed:
+        return level
+    # Galat level: "low" sabse kareebi fast option hai.
+    return "low" if "low" in allowed else ""
 
 # Jab AI jawab na de paaye (server load/down) to user ko ye message jaata hai.
 # {ai_link} ki jagah "AI" block ka link khud lag jaata hai.
@@ -447,6 +536,55 @@ AI_BUSY_MESSAGE = os.getenv("AI_BUSY_MESSAGE", (
     "My server is busy right now, so I could not answer.\n\n"
     "Please try again in a little while — or talk to the AI directly ({ai_link})."
 ))
+
+
+# ---------------------------------------------------------------------
+# #8b  PRIVACY / DATA RETENTION  (audit PRIV-01)
+# ---------------------------------------------------------------------
+# BotFather > Bot Settings > Privacy Policy me jo URL daalna hai (Render par
+# apne repo ka PRIVACY.md raw link, ya apni site).
+PRIVACY_URL = os.getenv("PRIVACY_URL", "")
+# /privacy par jo dikhta hai. Khaali = built-in text (neeche).
+PRIVACY_TEXT = os.getenv("PRIVACY_TEXT", "")
+# Kitne din baad purane cache (done / requests / audit) saaf ho jayen. 0 = off.
+CACHE_RETENTION_DAYS = _int_env("CACHE_RETENTION_DAYS", 30)
+# Kitne din tak bilkul inactive user ka record rakhein. 0 = hamesha (default).
+# Ye privacy ke liye hai, analytics ke liye nahi — chhota rakho to data kam.
+USER_RETENTION_DAYS = _int_env("USER_RETENTION_DAYS", 0)
+
+# Built-in privacy notice. {bot} {privacy_url} {community} placeholders.
+# ZAROORI: isme AI provider ka naam hai — Telegram ki Bot Developer Terms
+# kehti hain ki user ko batana chahiye ki uski baat kahan jaati hai. Bot ki
+# normal baat-cheet me provider ka naam NAHI aata (AI_SYSTEM_PROMPT wahi
+# rakhta hai) — sirf ye notice exception hai.
+DEFAULT_PRIVACY_TEXT = (
+    "PRIVACY\n\n"
+    "What is stored\n"
+    "- Your Telegram user id, first name, username (if any), and when you "
+    "first started the bot.\n"
+    "- Your invite count, and which user came through your link.\n"
+    "- Group / channel ids the bot is in, so it can verify membership.\n"
+    "- The last few messages of a conversation, only in the bot's memory, so "
+    "it can follow the thread. This is cleared on restart.\n\n"
+    "What is NOT stored\n"
+    "- Your phone number, email, contacts, or any file you send.\n"
+    "- Your messages in groups the bot is not mentioned in.\n\n"
+    "Who else sees your text\n"
+    "When you ask the assistant a question, that text (and the recent turns of "
+    "the conversation) is sent to our AI provider, Google (Gemini API), only "
+    "to generate the reply. It is not used to train models by us, and we do "
+    "not sell data.\n\n"
+    "How long\n"
+    "Account data stays until you delete it or the bot is shut down. Temporary "
+    "caches (join-request records, verification marks, admin action log) are "
+    "removed after {cache_days} days.\n\n"
+    "Your control\n"
+    "Send /delete_my_data at any time to erase your record, your referral "
+    "count, and your conversation memory. It takes effect immediately.\n\n"
+    "Contact\n"
+    "Questions or a deletion request for group data: message the bot owner "
+    "or the community at {community}.\n"
+)
 
 
 # ---------------------------------------------------------------------
