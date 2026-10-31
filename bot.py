@@ -2117,7 +2117,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer()
             return
         t = data.split(":", 1)[1]
-        _post_flow[user.id] = {"type": t, "step": 0, "data": {}, "channels": []}
+        _post_flow[user.id] = {"type": t, "step": 0, "data": {}, "channels": [],
+                               "_t": time.time()}
         await q.answer()
         try:
             await q.edit_message_text(f"{t} — let us begin.")
@@ -2560,9 +2561,14 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Flow kabhi expire nahi hota tha: /post shuru karke chhod dene par
         # us user ke saare DM hamesha _post_step me jaate aur chup-chaap
         # nigal liye jaate. Ab 30 min baad flow khud hat jata hai.
-        if time.time() - fl.get("_t", 0) > 1800:
+        started = fl.get("_t")
+        if started is None:
+            fl["_t"] = time.time()          # purana flow — abhi se gino
+            started = fl["_t"]
+        if time.time() - started > 1800:
             _post_flow.pop(user.id, None)
         else:
+            fl["_t"] = time.time()          # touch — active flow expire na ho
             await _post_step(update, context)
             return
     # Kisi channel/group ka message forward kiya? (chat id nikalne ke liye)
